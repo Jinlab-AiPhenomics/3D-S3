@@ -79,7 +79,7 @@ Check our [***3D-USF***](https://github.com/Tang-855/3D-USF/) for detailed instr
 
 The installation commands for *DGCNN, Point Cloud Transformer, PointNet++, PointNeXt, PointMLP* and *PointConv* models are basically the same, using DGCNN as an example:
 For example: 
--  Running the DGCNN model:
+-  Running the PointConv model:
 
 ```
 cd 3D-USF/blob/main/output/
@@ -87,10 +87,20 @@ chmod +x nohup.sh
 ./nohup.sh &
 ```
 
----
+If you want to run other models, please modify the run command in the nohup.sh file. For example, if you want to run the DGCNN model, change the command to:
+```
+nohup python dgcnn_main.py > /your root/Pointnext/output/dgcnn.log 2>&1 &
+```
+
+If you want to run other models, please modify the run command in the nohup.sh file. For example, if you want to run the Point Transformer model, change the command to:
+```
+nohup python pct_main.py > /your root/Pointnext/output/pct.log 2>&1 &
+```
+
+Other models are similar; you only need to change the python file name of ""，that you want to run in the run command of the n file.
 
 ### Acknowledgment
 This library is inspired by [PointNeXt](https://guochengqian.github.io/PointNeXt/modelzoo/). 
 
 ### Citation
-If you find ***3D-USF*** useful, please cite.
+If you find ***3D-S3*** useful, please cite.
