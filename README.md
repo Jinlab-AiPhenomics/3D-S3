@@ -82,7 +82,7 @@ For example:
 -  Running the PointConv model:
 
 ```
-cd 3D-USF/blob/main/output/
+cd your root/output/
 chmod +x nohup.sh
 ./nohup.sh &
 ```
