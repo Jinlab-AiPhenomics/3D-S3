@@ -75,7 +75,7 @@ If the above command fails to install successfully, please open the `install.sh`
 
 ## Run 
 
-Check our [***3D-s3***](https://github.com/Tang-855/3D-USF/) for detailed instructions. 
+Check our [***3D-S3***](https://github.com/Tang-855/3D-USF/) for detailed instructions. 
 
 The installation commands for *DGCNN, Point Cloud Transformer, PointNet++, PointNeXt, PointMLP* and *PointConv* models are basically the same, using DGCNN as an example:
 For example: 
