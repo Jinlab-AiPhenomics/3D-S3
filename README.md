@@ -97,7 +97,7 @@ If you want to run other models, please modify the run command in the nohup.sh f
 nohup python pct_main.py > /your root/Pointnext/output/pct.log 2>&1 &
 ```
 
-Other models are similar; you only need to change the python file name of ""，that you want to run in the run command of the n file.
+Other models are similar; you only need to change the python file name of "examples/shapenetpart/model_name.py"，that you want to run in the run command of the n file.
 
 ### Acknowledgment
 This library is inspired by [PointNeXt](https://guochengqian.github.io/PointNeXt/modelzoo/). 
