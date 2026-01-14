@@ -27,26 +27,26 @@
 
 **Wheat**
 -  Under the 10 sample sizes of [10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 100%], the segmentation performance of *DGCNN, Point Cloud Transformer, PointNet++, PointNeXt, PointMLP* and *PointConv* based on fully supervised learning and ***3D-S3*** has been improved to varying degrees.
-<p align="center">
+<!-- <p align="center">
 <img src="docs/projects/misc/Wheat_training size.png" width=85% height=85% class="center">
-</p>
+</p> -->
 
 -  Under the 12 annotation ratio of [1%, 5%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 100%], the segmentation performance of *PointConv* based on fully supervised learning and ***3D-S3*** , Significantly reduce PointConv's reliance on the proportion of labeled data.
-<p align="center">
+<!-- <p align="center">
 <img src="docs/projects/misc/wheat_annotation levels.png" width=85% height=85% class="center">
-</p>
+</p> -->
 
 
 **Rice**
 -  Based on the *PointMLP* model, the mIoU trend of semi-supervised and fully supervised learning in different rice samples
-<p align="center">
+<!-- <p align="center">
 <img src="docs/projects/misc/rice_samle.png" width=85% height=85% class="center">
-</p>
+</p> -->
 
 -  Based on the *PointMLP* model, the mIoU trend of semi-supervised and fully supervised learning in different annotation ratio of rice sample
-<p align="center">
+<!-- <p align="center">
 <img src="docs/projects/misc/rice_annotation.png" width=85% height=85% class="center">
-</p>
+</p> -->
 
 ## Model Performance
 Performance of ***3D-S3*** improvements are shown in the following areas:
