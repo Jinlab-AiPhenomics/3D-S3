@@ -399,7 +399,19 @@ def main(gpu, cfg):
     criterion = build_criterion_from_cfg(cfg.criterion_args).cuda()
     segcriterion = SegmentLoss().cuda()
     # ===> start training
-    best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+
+    # best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+    best_ins_miou, cls_miou_when_best, cls_mious_when_best = float('-inf'), 0., []
+    best_epoch = None
+
+    # Early Stopping 参数
+    early_stop_min_epoch = 100
+    early_stop_patience = 10
+    early_stop_min_delta = 0.0
+
+    early_stop_counter = 0
+    early_stop_reference = float('-inf')
+    early_stop_enabled = False
 
     for epoch in range(cfg.start_epoch, cfg.epochs + 1):
         if cfg.distributed:
@@ -428,6 +440,22 @@ def main(gpu, cfg):
                 with np.printoptions(precision=2, suppress=True):
                     logging.info(f'Find a better ckpt @E{epoch}, val_ins_miou {best_ins_miou:.2f} val_cls_miou {cls_miou_when_best:.2f}, 'f'\ncls_mious: {cls_mious_when_best}')
 
+        # 达到最小训练轮数后，开始监控 Early Stopping
+        if epoch % cfg.val_freq == 0 and epoch >= early_stop_min_epoch:
+            val_score = float(val_ins_miou.item())
+            if not early_stop_enabled:
+                early_stop_enabled = True
+                early_stop_reference = val_score
+                early_stop_counter = 0
+                logging.info(f"Early Stopping monitoring starts at epoch {epoch}.")
+            elif val_score > early_stop_reference + early_stop_min_delta:
+                early_stop_reference = val_score
+                early_stop_counter = 0
+            else:
+                early_stop_counter += 1
+            logging.info(
+                f"Early Stopping: {early_stop_counter}/{early_stop_patience} validation checks without improvement.")
+        
         lr = optimizer.param_groups[0]['lr']
         if writer is not None:
             writer.add_scalar('val_ins_miou', val_ins_miou, epoch)
@@ -464,6 +492,14 @@ def main(gpu, cfg):
         df3 = pd.DataFrame(record_epoch)
         save_path_4 = save_path + '/' + 'record_epoch.xlsx'  # 指定文件夹路径
         df3.to_excel(save_path_4, index=False)
+
+        # Early Stopping：决定是否提前结束训练
+        if early_stop_enabled and early_stop_counter >= early_stop_patience:
+            logging.info(
+                f"Early Stopping triggered at epoch {epoch}; "
+                f"best epoch: {best_epoch}, "
+                f"best val instance mIoU: {best_ins_miou:.4f}.")
+            break
 
     # if writer is not None:
     #     Wandb.add_file(os.path.join(cfg.ckpt_dir, f'{cfg.run_name}_ckpt_best.pth'))
