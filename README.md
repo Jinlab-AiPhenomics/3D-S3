@@ -38,12 +38,12 @@
 
 
 **Rice**
--  Based on the *PointMLP* model, the mIoU trend of semi-supervised and fully supervised learning in different rice samples
+-  Based on the *PointConv* model, the mIoU trend of semi-supervised and fully supervised learning in different rice samples
 <!-- <p align="center">
 <img src="docs/projects/misc/rice_samle.png" width=85% height=85% class="center">
 </p> -->
 
--  Based on the *PointMLP* model, the mIoU trend of semi-supervised and fully supervised learning in different annotation ratio of rice sample
+-  Based on the *PointConv* model, the mIoU trend of semi-supervised and fully supervised learning in different annotation ratio of rice sample
 <!-- <p align="center">
 <img src="docs/projects/misc/rice_annotation.png" width=85% height=85% class="center">
 </p> -->
