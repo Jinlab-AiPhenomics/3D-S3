@@ -39,11 +39,12 @@ from openpoints.transforms import build_transforms_from_cfg
 from openpoints.utils import AverageMeter, ConfusionMatrix
 from openpoints.utils import set_random_seed, save_checkpoint, load_checkpoint, resume_checkpoint, setup_logger_dist, \
     cal_model_parm_nums, Wandb, generate_exp_directory, resume_exp_directory, EasyConfig, dist_utils, find_free_port
-from openpoints.models.layers import furthest_point_sample
+
 from datautils.SelfSuperviseLoss import SegmentLoss
 
 
 from openpoints.models.Adaptive_Graph_Conv.model import Net
+# from openpoints.models.pointmlp.pointMLP import pointMLP
 from openpoints.models.pointconv.pointconv_sem_seg import pointconv
 from openpoints.models.dgcnn.model import DGCNN_partseg
 from openpoints.models.pointnet.pointnet_part_seg import pointnet_part
@@ -93,6 +94,7 @@ def get_ins_mious(pred, target, cls, cls2parts, multihead=False,):
         pred (_type_): _description_
         target (_type_): _description_
         num_classes (_type_): _description_
+        num_classes (_type_): _description_
     Returns:
         _type_: _description_
     """
@@ -135,6 +137,7 @@ def get_part_mious(pred, target, cls, cls2parts, multihead=False,):
     for shape_idx in range(pred.shape[0]):  # sample_idx
         part_ious = []
         mypart_iou = []
+        x= cls[shape_idx]
         parts = cls2parts[cls[shape_idx]]   # parts = [0,1]
         if multihead:
             parts = np.arange(len(parts))
@@ -331,6 +334,7 @@ def main(gpu, cfg):
     device = torch.device('cuda:0')  # model = build_model_from_cfg(cfg.model).cuda()
     # model = Net().to(device)
     # model = DGCNN_partseg().to(device)
+    # model = pointMLP(2, 4096).to(device)  # partnums, points
     model = pointconv().to(device)
     # model = pointnet_part().to(device)
     # # model = pointnet2().to(device)
@@ -343,7 +347,7 @@ def main(gpu, cfg):
     # #加载自监督参数 (在selfprepath和temppath中任选一种 即可)
     '''方法一'''
     try:
-        selfprepath = r"/data_1/home/whs/Pointnext/examples/shapenetpart/log/shapenetpart/unsupervised/unsupervised_pointconv/checkpoint/_ckpt_latest.pth"
+        selfprepath = r"/data/home/whs/Pointnext/examples/shapenetpart/log/shapenetpart/unsupervised/unsupervised_pointconv/checkpoint/_ckpt_latest.pth"
         logging.info('load self-pretrained params')
         current_weights = model.state_dict()  # 参看当前模型的参数模型
         load_checkpoint(model, pretrained_path=selfprepath)
@@ -404,7 +408,19 @@ def main(gpu, cfg):
     criterion = build_criterion_from_cfg(cfg.criterion_args).cuda()
     segcriterion = SegmentLoss().cuda()
     # ===> start training
-    best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+    
+    # best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+    best_ins_miou, cls_miou_when_best, cls_mious_when_best = float('-inf'), 0., []
+    best_epoch = None
+
+    # Early Stopping 参数
+    early_stop_min_epoch = 100
+    early_stop_patience = 10
+    early_stop_min_delta = 0.0
+
+    early_stop_counter = 0
+    early_stop_reference = float('-inf')
+    early_stop_enabled = False
 
     for epoch in range(cfg.start_epoch, cfg.epochs + 1):
         if cfg.distributed:
@@ -413,6 +429,7 @@ def main(gpu, cfg):
         if hasattr(train_loader.dataset, 'epoch'):
             train_loader.dataset.epoch = epoch - 1
         cfg.epoch = epoch                       # 训练
+
         train_loss = \
             train_one_epoch(model, train_loader, criterion, segcriterion, optimizer, scheduler, epoch, cfg)
 
@@ -435,6 +452,22 @@ def main(gpu, cfg):
                         f'Find a better ckpt @E{epoch}, val_ins_miou {best_ins_miou:.2f} val_cls_miou {cls_miou_when_best:.2f}, '
                         f'\ncls_mious: {cls_mious_when_best}')
 
+        # 达到最小训练轮数后，开始监控 Early Stopping
+        if epoch % cfg.val_freq == 0 and epoch >= early_stop_min_epoch:
+            val_score = float(val_ins_miou.item())
+            if not early_stop_enabled:
+                early_stop_enabled = True
+                early_stop_reference = val_score
+                early_stop_counter = 0
+                logging.info(f"Early Stopping monitoring starts at epoch {epoch}.")
+            elif val_score > early_stop_reference + early_stop_min_delta:
+                early_stop_reference = val_score
+                early_stop_counter = 0
+            else:
+                early_stop_counter += 1
+            logging.info(
+                f"Early Stopping: {early_stop_counter}/{early_stop_patience} validation checks without improvement.")
+        
         lr = optimizer.param_groups[0]['lr']
         if writer is not None:
             writer.add_scalar('val_ins_miou', val_ins_miou, epoch)
@@ -454,7 +487,7 @@ def main(gpu, cfg):
         print("Start saving data")
         model_name = cfg.cfg_basename.split('_')[0]
         # save_path = 'log/pictures/' + model_name  # 指定
-        save_path = "/data/home/whs/Pointnext/examples/shapenetpart/log/pictures/pointconv/wheat_pointconv_super_5/"
+        save_path = "/data/home/whs/Pointnext/examples/shapenetpart/log/pictures/rice_pointconv/pointconv_10_un/"
         if not os.path.exists(save_path):  # 如果文件夹不存在，则创建它
             os.makedirs(save_path)
         df = pd.DataFrame(record_all)
@@ -472,6 +505,14 @@ def main(gpu, cfg):
         df3 = pd.DataFrame(record_epoch)
         save_path_4 = save_path + '/' + 'record_epoch.xlsx'  # 指定文件夹路径
         df3.to_excel(save_path_4, index=False)
+
+        # Early Stopping：决定是否提前结束训练
+        if early_stop_enabled and early_stop_counter >= early_stop_patience:
+            logging.info(
+                f"Early Stopping triggered at epoch {epoch}; "
+                f"best epoch: {best_epoch}, "
+                f"best val instance mIoU: {best_ins_miou:.4f}.")
+            break
 
     # if writer is not None:
     #     Wandb.add_file(os.path.join(cfg.ckpt_dir, f'{cfg.run_name}_ckpt_best.pth'))
@@ -504,129 +545,6 @@ def main(gpu, cfg):
     if writer is not None:
         writer.close()
 
-    # 保存为Excel文件
-    # print("Start saving data")
-    # model_name = cfg.cfg_basename.split('_')[0]
-    # save_path = 'log/pictures/' + model_name  # 指定
-    # if not os.path.exists(save_path):  # 如果文件夹不存在，则创建它
-    #     os.makedirs(save_path)
-    # df = pd.DataFrame(record_all)
-    # save_path_1 = save_path + '/' + 'record_all.xlsx'  # 指定文件夹路径
-    # df.to_excel(save_path_1, index=False)
-    #
-    # df1 = pd.DataFrame(record_iter_train)
-    # save_path_2 = save_path + '/' + 'record_iter_train.xlsx'  # 指定文件夹路径
-    # df1.to_excel(save_path_2, index=False)
-    #
-    # df2 = pd.DataFrame(record_iter_val)
-    # save_path_3 = save_path + '/' + 'record_iter_val.xlsx'  # 指定文件夹路径
-    # df2.to_excel(save_path_3, index=False)
-    #
-    # df3 = pd.DataFrame(record_epoch)
-    # save_path_4 = save_path + '/' + 'record_epoch.xlsx'  # 指定文件夹路径
-    # df3.to_excel(save_path_4, index=False)
-
-    # 绘制loss的折线图并保存到指定文件夹
-    fig, ax = plt.subplots()
-    ax.plot(record_iter_val['loss'], label='iter_loss_val')
-    ax.plot(record_iter_train['loss'], label='iter_loss_train')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss')
-    # 设置x轴和y轴范围及刻度
-    plt.xlim(0, epoch + 1)
-    plt.xticks(np.arange(0, epoch + 1, 3))
-    max_y1 = math.ceil(max(record_iter_train['loss']))
-    if max_y1 <= 1:
-        plt.ylim(0, 1)
-        plt.yticks(np.arange(0, max_y1, 0.1))
-    else:
-        plt.ylim(0, max_y1)
-        plt.yticks(np.arange(0, max_y1, max_y1 / 10))
-    ax.legend()
-    fig.savefig(os.path.join(save_path, 'Iter_Loss.png'))
-    # plt.show()
-
-    # 绘制loss的折线图并保存到指定文件夹
-    fig, ax = plt.subplots()
-    ax.plot(record_epoch['train'], label='Train Loss')
-    ax.plot(record_epoch['val'], label='Val Loss')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss')
-    # 设置x轴和y轴范围及刻度
-    plt.xlim(0, epoch + 1)
-    plt.xticks(np.arange(0, epoch + 1, 3))
-    max_y1 = math.ceil(max(record_epoch['val']))
-    if max_y1 <= 1:
-        plt.ylim(0, 1)
-        plt.yticks(np.arange(0, max_y1, 0.1))
-    else:
-        plt.ylim(0, max_y1)
-        plt.yticks(np.arange(0, max_y1, max_y1 / 10))
-    ax.legend()
-    fig.savefig(os.path.join(save_path, 'Loss.png'))
-    # plt.show()
-
-    # 绘制iou的折线图并保存到指定文件夹
-    fig, ax = plt.subplots()
-    ax.plot(record_all['IoU spike'], label='IoU of spike')
-    ax.plot(record_all['IoU leaf'], label='IoU of leaf')
-    ax.plot(record_all['IoU'], label='IoU')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Test IoU')
-    # 设置x轴和y轴范围及刻度
-    plt.xlim(0, epoch + 1)
-    plt.xticks(np.arange(0, epoch + 1, 3))
-    plt.ylim(0, 1)
-    plt.yticks(np.arange(0, 1, 0.1))
-    ax.legend()
-    fig.savefig(os.path.join(save_path, 'IoU.png'))
-    # plt.show()
-
-    # 绘制准确度的折线图并保存到指定文件夹
-    fig, ax = plt.subplots()
-    ax.plot(record_all['test acc'], label='test acc')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Test accuracy')
-    # 设置x轴和y轴范围及刻度
-    plt.xlim(0, epoch + 1)
-    plt.xticks(np.arange(0, epoch + 1, 3))
-    plt.ylim(0, 1)
-    plt.yticks(np.arange(0, 1, 0.1))
-    ax.legend()
-    fig.savefig(os.path.join(save_path, 'Accuracy.png'))
-    # plt.show()
-
-    # 绘制精度的折线图并保存到指定文件夹
-    fig, ax = plt.subplots()
-    ax.plot(record_all['spike test pre'], label='spike test precision')
-    ax.plot(record_all['leaf test pre'], label='leaf test precision')
-    ax.plot(record_all['test pre'], label='test precision')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Test precision')
-    # 设置x轴和y轴范围及刻度
-    plt.xlim(0, epoch + 1)
-    plt.xticks(np.arange(0, epoch + 1, 3))
-    plt.ylim(0, 1)
-    plt.yticks(np.arange(0, 1, 0.1))
-    ax.legend()
-    fig.savefig(os.path.join(save_path, 'Precision.png'))
-    # plt.show()
-
-    # 绘制recall的折线图并保存到指定文件夹
-    fig, ax = plt.subplots()
-    ax.plot(record_all['spike test recall'], label='spike test recall')
-    ax.plot(record_all['leaf test recall'], label='leaf test recall')
-    ax.plot(record_all['test recall'], label='test recall')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Test recall')
-    # 设置x轴和y轴范围及刻度
-    plt.xlim(0, epoch + 1)
-    plt.xticks(np.arange(0, epoch + 1, 3))
-    plt.ylim(0, 1)
-    plt.yticks(np.arange(0, 1, 0.1))
-    ax.legend()
-    fig.savefig(os.path.join(save_path, 'Recall.png'))
-    # plt.show()
 
     #dist.destroy_process_group()
     wandb.finish(exit_code=True)
@@ -636,6 +554,7 @@ def train_one_epoch(model, train_loader, criterion, segcriterion, optimizer, sch
 
     loss_meter = AverageMeter()
     model.train()  # set model to training mode
+    # device = torch.device('cuda:0')
 
     #fine-tuning  冻结的层数
     #freeze_layer = ["encoder","decoder"]
@@ -714,6 +633,8 @@ def train_one_epoch(model, train_loader, criterion, segcriterion, optimizer, sch
             ############ new loss ##################
 
             #######Ori Loss
+            # loss = criterion(logits, target)  # logits = [8, 2, 4096]，  target = [8, 4096]
+            ### 半监督时使用
             loss = criterion(logits, target)  # logits = [8, 2, 4096]，  target = [8, 4096]
             ##############
 
@@ -750,6 +671,7 @@ def train_one_epoch(model, train_loader, criterion, segcriterion, optimizer, sch
 def validate(model, val_loader, cfg, epoch, criterion, num_votes=0, data_transform=None):  ##############第5步
 
     loss_meter = AverageMeter()  ##############第一步
+    device = torch.device('cuda:0')
 
     model.eval()  # set model to eval mode
     pbar = tqdm(enumerate(val_loader), total=val_loader.__len__())
@@ -788,12 +710,36 @@ def validate(model, val_loader, cfg, epoch, criterion, num_votes=0, data_transfo
                 data_all = data_transform(data_all)
             logits += model(data_all)
         logits /= (num_votes + 1)
-        preds = logits.max(dim=1)[1]   #preds即为所求类别
-        # print(preds.shape)
-        # print(data_all.shape)
-        # if cfg.get('refine', False):
-        #     part_seg_refinement(preds, data['pos'], data['cls'], cfg.cls2parts, cfg.get('refine_n', 10))
-        #     part_seg_refinement(preds, data_all, data['cls'], cfg.cls2parts, cfg.get('refine_n', 10))
+
+
+        ### 全监督时使用 logits=[8,2,4096]   preds=[8,4096]
+        # preds = logits.max(dim=1)[1]   #preds即为所求类别
+        # if cfg.criterion_args.NAME != 'MultiShapeCrossEntropy':
+        #     batch_ins_mious,batch_part_iou = get_part_mious(preds, target, data['cls'], cfg.cls2parts)
+        #     batch_ins_macc,batch_part_acc = get_part_acc(preds, target, data['cls'], cfg.cls2parts)
+        #     batch_ins_mpre,batch_part_pre = get_part_pre(preds, target, data['cls'], cfg.cls2parts)
+        #     batch_ins_mrecall,batch_part_recall = get_part_recall(preds, target, data['cls'], cfg.cls2parts)
+        #     ins_miou_list += batch_ins_mious    # IoU
+        #     part_iou.append(batch_part_iou)
+        #     ins_macc_list += batch_ins_macc     # acc
+        #     part_acc.append(batch_part_acc)
+        #     ins_mpre_list += batch_ins_mpre    # pre
+        #     part_pre.append(batch_part_pre)
+        #     ins_mrecall_list += batch_ins_mrecall    # recall
+        #     part_recall.append(batch_part_recall)
+        #     loss = criterion(logits, target)   ##############第2步
+        # else:
+        #     iou_array = []
+        #     for ib in range(batch_size):
+        #         sl = data['cls'][ib][0]
+        #         iou = get_ins_mious(preds[ib:ib + 1], target[ib:ib + 1], sl.unsqueeze(0), cfg.cls2parts, multihead=True)
+        #         iou_array.append(iou)
+        #     ins_miou_list += iou_array
+
+
+        ### 半监督时使用 logits=[8,2,2048]   preds=[8,2048]
+
+        preds = logits.max(dim=1)[1]  # preds即为所求类别
         if cfg.criterion_args.NAME != 'MultiShapeCrossEntropy':
             batch_ins_mious,batch_part_iou = get_part_mious(preds, target, data['cls'], cfg.cls2parts)
             batch_ins_macc,batch_part_acc = get_part_acc(preds, target, data['cls'], cfg.cls2parts)
@@ -808,6 +754,7 @@ def validate(model, val_loader, cfg, epoch, criterion, num_votes=0, data_transfo
             ins_mrecall_list += batch_ins_mrecall    # recall
             part_recall.append(batch_part_recall)
             loss = criterion(logits, target)   ##############第2步
+
         else:
             iou_array = []
             for ib in range(batch_size):
@@ -959,7 +906,7 @@ def testmetric(model, val_loader, cfg, num_votes=0, data_transform=None):
         bsize, _, _ = seg_points.shape
         leafarr = []
         disarr = []
-        predictedpath = "/data/home/whs/Pointnext/examples/shapenetpart/log/visual/pointconv/wheat_pointconv_super_5/"  # 保存可视化预测结果的txt的路径
+        predictedpath = "/data/home/whs/Pointnext/examples/shapenetpart/log/visual/rice_pointconv/pointconv_10_un/"  # 保存可视化预测结果的txt的路径
         if not os.path.exists(predictedpath):
             os.makedirs(predictedpath)
 
@@ -1143,7 +1090,9 @@ if __name__ == "__main__":
     for i, opt in enumerate(opts):
         if 'rank' not in opt and 'dir' not in opt and 'root' not in opt and 'pretrain' not in opt and 'path' not in opt and 'wandb' not in opt and '/' not in opt:
             opt_list.append(opt)
-    cfg.root_dir = os.path.join(cfg.root_dir, cfg.task_name)
+    # cfg.root_dir = os.path.join(cfg.root_dir, cfg.task_name)   # 原始定义log日志的方法
+    cfg.root_dir = "/data/home/whs/Pointnext/examples/shapenetpart/log/shapenetpart/rice_pointconv/pointconv_10_un"
+
     cfg.opts = '-'.join(opt_list)
 
     cfg.is_training = cfg.mode not in ['test', 'testing', 'val', 'eval', 'evaluation']
