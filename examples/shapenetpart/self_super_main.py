@@ -34,11 +34,13 @@ from openpoints.models.pointnet.pointnet_part_seg import pointnet_part     # 1-p
 from openpoints.models.pointnet2.pointnet2_part_seg_msg import pointnet2   # 2-pointnet++模型
 from openpoints.models.dgcnn.model import DGCNN_partseg                    # 3-DGCNN模型
 from openpoints.models.pct.pct import Point_Transformer_partseg            # 4-Point_Transformer模型
-from openpoints.models.GDANet.GDANet_ptseg import GDANet                   # 5-GDANet模型
 from openpoints.models.pointmlp.pointMLP import pointMLP                   # 6-pointMLP模型
-from openpoints.models.curvenet.curvenet_seg import CurveNet               # 7-CurveNet模型
-from openpoints.models.pointstack.PointStack import MyPointStack           # 8-pointstack模型
-from openpoints.models.mymodel_pct.model import PointTransformerSeg   # 自己的模型
+from openpoints.models.pointconv.pointconv_sem_seg import pointconv
+# #from openpoints.models.pointtransformer.model import PointTransformerSeg
+# from openpoints.models.GDANet.GDANet_ptseg import GDANet                   # 5-GDANet模型
+# from openpoints.models.curvenet.curvenet_seg import CurveNet               # 7-CurveNet模型
+# from openpoints.models.pointstack.PointStack import MyPointStack           # 8-pointstack模型
+# from openpoints.models.mymodel_pct.model import PointTransformerSeg   # 自己的模型
 
 from openpoints.models import build_model_from_cfg
 from openpoints.models.layers import torch_grouping_operation, knn_point
@@ -260,10 +262,6 @@ def main(gpu, cfg):
     # build dataset
     val_loader = build_dataloader_from_cfg(cfg.batch_size, cfg.dataset, cfg.dataloader, datatransforms_cfg=cfg.datatransforms, split='val', distributed=cfg.distributed)
     test_loader = build_dataloader_from_cfg(cfg.batch_size, cfg.dataset, cfg.dataloader, datatransforms_cfg=cfg.datatransforms, split='test', distributed=cfg.distributed)
-    train_loader = build_dataloader_from_cfg(cfg.batch_size, cfg.dataset, cfg.dataloader,datatransforms_cfg=cfg.datatransforms, split='train', distributed=cfg.distributed,)
-    logging.info(f"length of validation dataset: {len(test_loader.dataset)}")
-    logging.info(f"length of training dataset: {len(train_loader.dataset)}")
-    logging.info(f"length of validation dataset: {len(val_loader.dataset)}")
 
     num_classes = val_loader.dataset.num_classes if hasattr(val_loader.dataset, 'num_classes') else None
     if num_classes is not None:
@@ -283,14 +281,16 @@ def main(gpu, cfg):
     # model = build_model_from_cfg(cfg.model).cuda()
     device = torch.device('cuda:0')
     # model = pointnet_part().to(device)    # 1-PointNet模型
-    # model = pointnet2().cuda()            # 2-PointNet++模型
-    model = DGCNN_partseg().to(device)    # 3-DGCNN_partseg模型
+    # model = pointnet2().cuda()              # 2-PointNet++模型
+    # model = DGCNN_partseg().to(device)    # 3-DGCNN_partseg模型
+    # model = PointTransformerSeg().to(device)               # 4-Point_Transformer模型
     # model = Point_Transformer_partseg().to(device)       # 4-Point_Transformer模型
     # model = GDANet().to(device)           # 5-GDANet模型
     # model = pointMLP(2,4096).to(device)     # 6-pointMLP模型   partnums, points
     # model = CurveNet().to(device)           # 7-CurveNet模型
     # model = MyPointStack().to(device)       # 8-PointStack模型  partnums, points
     # model = build_model_from_cfg(cfg.model).cuda()   # 9-Spotr模型   10-Pointnext模型
+    model = pointconv().to(device)
 
     model_size = cal_model_parm_nums(model)
     logging.info(model)
@@ -300,15 +300,13 @@ def main(gpu, cfg):
     # #加载自监督参数 (在selfprepath和temppath中任选一种 即可)
     '''方法一'''
     try:
-        # selfprepath = r"D:\a-project-T\Pointnext\examples\shapenetpart\log\shapenetpart\1_UnGlobal\checkpoint\_ckpt_latest.pth"
-        selfprepath = r"/data/home/whs/Pointnext/examples/shapenetpart/log/shapenetpart/DGCNN/checkpoint/_ckpt_latest.pth"
-        # selfprepath = r".\log\shapenetpart\DGCNN\checkpoint\_ckpt_latest.pth"
+        selfprepath = r"/root_1/autodl-tmp/Pointnext/examples/shapenetpart/log/shapenetpart/pointmlp/checkpoint/_ckpt_latest.pth"
         logging.info('load self-pretrained params')
         current_weights = model.state_dict()  # 参看当前模型的参数模型
         load_checkpoint(model, pretrained_path=selfprepath)
         pretrained_model = torch.load(selfprepath)
         # pretrained_model = torch.load(r".\log\shapenetpart\supervise-pointnet2_seed14\checkpoint\_ckpt_latest.pth")  # 加载预训练模型
-        cfg.start_epoch = pretrained_model['epoch']+1  # 加载当前的预训练epoch
+        cfg.start_epoch = pretrained_model['epoch']  # 加载当前的预训练epoch
         logging.info('**************************Use pretrain model**************************')
     except:
         logging.info('No existing model, starting training from scratch...')
@@ -356,6 +354,10 @@ def main(gpu, cfg):
         logging.info('Training from scratch')
 
 
+    train_loader = build_dataloader_from_cfg(cfg.batch_size, cfg.dataset, cfg.dataloader,datatransforms_cfg=cfg.datatransforms, split='train', distributed=cfg.distributed,)
+    # logging.info(f"length of validation dataset: {len(test_loader.dataset)}")
+    logging.info(f"length of training dataset: {len(train_loader.dataset)}")
+    # logging.info(f"length of validation dataset: {len(val_loader.dataset)}")
 
     # 加载权重和损失
     if cfg.get('cls_weighed_loss', False):
@@ -374,80 +376,89 @@ def main(gpu, cfg):
     #finalcriterion = Finalloss().cuda()
     finalcriterion = MultiLossLayer(2).cuda()               # 3   局部损失
 
-    # ===> start training
-    best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+    # ===> start training (Early Stopping)
+    patience = int(cfg.get('early_stop_patience', 30))
+    min_delta = float(cfg.get('early_stop_min_delta', 0.0001))
+    min_epochs = int(cfg.get('early_stop_min_epochs', 100))
+    if patience < 1 or min_epochs < 0 or not math.isfinite(min_delta) or min_delta < 0:
+        raise ValueError('Invalid early stopping configuration')
 
-    minloss = 99
+    minloss = float('inf')
+    reference_loss = float('inf')
+    best_epoch = None
+    bad_epochs = 0
+    completed_epochs = 0
+    epoch = int(cfg.start_epoch)
+    logging.info(f'Early stopping: patience={patience}, min_delta={min_delta}, min_epochs={min_epochs}')
 
-    for epoch in range(cfg.start_epoch, cfg.epochs + 1):
+    # cfg.epochs is retained for the original LR scheduler only.
+    while True:
         if cfg.distributed:
             train_loader.sampler.set_epoch(epoch)
-        # some dataset sets the dataset length as a fixed steps.
         if hasattr(train_loader.dataset, 'epoch'):
             train_loader.dataset.epoch = epoch - 1
         cfg.epoch = epoch
-        train_loss = \
-            train_one_epoch(model, train_loader, globalcriterion, localcriterion, finalcriterion, optimizer, scheduler, epoch, cfg)
+        train_loss = float(train_one_epoch(
+            model, train_loader, globalcriterion, localcriterion,
+            finalcriterion, optimizer, scheduler, epoch, cfg))
 
+        # Use the same monitored loss on every distributed worker.
+        if cfg.distributed:
+            loss_tensor = torch.tensor(train_loss, dtype=torch.float64,
+                                       device=next(model.parameters()).device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            train_loss = loss_tensor.item() / dist.get_world_size()
+        if not math.isfinite(train_loss):
+            raise FloatingPointError(f'Non-finite training loss at epoch {epoch}: {train_loss}')
 
+        completed_epochs += 1
         record_epoch['epoch'].append(epoch)
-        record_epoch['train'].append(train_loss)  # 每次epoch的loss
+        record_epoch['train'].append(train_loss)
 
-        if train_loss < minloss:
-            # mysavepath = "D:/pythonproject/Pointnext/examples/shapenetpart/mybestself.pth"
-            logging.info('finding the new best model params...')
-            minloss = train_loss
-            save_checkpoint(cfg, model, epoch, optimizer, scheduler)
-            #torch.save(model.state_dict(),mysavepath)
-
-        # if epoch % cfg.val_freq == 0:
-        #     val_ins_miou, val_cls_miou, val_cls_mious = validate_fn(model, val_loader, cfg)
-        #     if val_ins_miou > best_ins_miou:
-        #         best_ins_miou = val_ins_miou
-        #         cls_miou_when_best = val_cls_miou
-        #         cls_mious_when_best = val_cls_mious
-        #         best_epoch = epoch
-        #         is_best = True
-        #         with np.printoptions(precision=2, suppress=True):
-        #             logging.info(
-        #                 f'Find a better ckpt @E{epoch}, val_ins_miou {best_ins_miou:.2f} val_cls_miou {cls_miou_when_best:.2f}, '
-        #                 f'\ncls_mious: {cls_mious_when_best}')
-
-
-       # lr = optimizer.param_groups[0]['lr']
-
-
-        # if writer is not None:
-        #     writer.add_scalar('val_ins_miou', val_ins_miou, epoch)
-        #     writer.add_scalar(1'val_class_miou', val_cls_miou, epoch)
-        #     writer.add_scalar('best_val_instance_miou',
-        #                       best_ins_miou, epoch)
-        #     writer.add_scalar('val_class_miou_when_best', cls_miou_when_best, epoch)
-        #     writer.add_scalar('train_loss', train_loss, epoch)
-        #     writer.add_scalar('lr', lr, epoch)
-
-        if cfg.sched_on_epoch:
+        # Preserve the original LR schedule, holding the last scheduled LR
+        # after its nominal horizon instead of extending/restarting it.
+        if cfg.sched_on_epoch and epoch <= cfg.epochs:
             scheduler.step(epoch)
 
-        # 保存为Excel文件
-    model_name = cfg.cfg_basename.split('_')[0]
-    save_path = 'log/pictures/' + model_name + '1'  # 指定
-    if not os.path.exists(save_path):  # 如果文件夹不存在，则创建它
-        os.makedirs(save_path)
+        # Save every strict improvement, independently of min_delta.
+        if train_loss < minloss:
+            minloss = train_loss
+            best_epoch = epoch
+            if cfg.rank == 0:
+                logging.info(f'New best model: epoch={epoch}, loss={minloss:.8f}')
+                save_checkpoint(cfg, model, epoch, optimizer, scheduler)
 
-    df1 = pd.DataFrame(record_iter_train)
-    save_path_2 = save_path + '/' + 'record_iter_train.xlsx'  # 指定文件夹路径
-    df1.to_excel(save_path_2, index=False)
+        if completed_epochs <= min_epochs:
+            reference_loss = min(reference_loss, train_loss)
+            bad_epochs = 0
+        elif train_loss < reference_loss - min_delta:
+            reference_loss = train_loss
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
 
-    df3 = pd.DataFrame(record_epoch)
-    save_path_4 = save_path + '/' + 'record_epoch.xlsx'  # 指定文件夹路径
-    df3.to_excel(save_path_4, index=False)
+        if cfg.rank == 0:
+            logging.info(f'Epoch {epoch}: loss={train_loss:.8f}, best={minloss:.8f}, '
+                         f'best_epoch={best_epoch}, patience={bad_epochs}/{patience}')
+            model_name = cfg.cfg_basename.split('_')[0]
+            save_path = 'log/pictures/' + model_name + '1'
+            os.makedirs(save_path, exist_ok=True)
+            pd.DataFrame(record_iter_train).to_excel(
+                os.path.join(save_path, 'record_iter_train.xlsx'), index=False)
+            pd.DataFrame(record_epoch).to_excel(
+                os.path.join(save_path, 'record_epoch.xlsx'), index=False)
+
+        if bad_epochs >= patience:
+            logging.info(f'Early stopping at epoch {epoch}; best epoch={best_epoch}, '
+                         f'best loss={minloss:.8f}, completed epochs={completed_epochs}')
+            break
+        epoch += 1
 
     '''画图代码
     # 设置x轴和y轴范围及刻度
     fig, ax = plt.subplots()
-    plt.xlim(0, cfg.epochs + 1)
-    plt.xticks(np.arange(0, cfg.epochs + 1, 3))
+    plt.xlim(0, epoch + 1)
+    plt.xticks(np.arange(0, epoch + 1, 3))
     max_y1 = math.ceil(max(record_iter_train['loss']))
     if max_y1 <= 1:
         plt.ylim(0, 1)
@@ -492,7 +503,7 @@ def main(gpu, cfg):
     #     load_checkpoint(model, pretrained_path=os.path.join(
     #         cfg.ckpt_dir, 'ckpt_best.pth'))
     #     set_random_seed(cfg.seed)
-                                                              #     test_ins_miou, test_cls_miou, test_cls_mious  = validate_fn(model, val_loader, cfg, num_votes=cfg.get('num_votes', 0),
+    #     test_ins_miou, test_cls_miou, test_cls_mious  = validate_fn(model, val_loader, cfg, num_votes=cfg.get('num_votes', 0),
     #                              data_transform=voting_transform)
     #     with np.printoptions(precision=2, suppress=True):
     #         logging.info(f'---Voting---\nBest Epoch {best_epoch},'
@@ -506,7 +517,8 @@ def main(gpu, cfg):
     torch.cuda.synchronize()
     # if writer is not None:
     #     writer.close()
-    #dist.destroy_process_group()
+    if cfg.distributed:
+        dist.destroy_process_group()
     wandb.finish(exit_code=True)
 
 
@@ -561,7 +573,6 @@ def train_one_epoch(model, train_loader, globalcriterion, localcriterion, finalc
         for key in data2.keys():
             data2[key] = data2[key].cuda(non_blocking=True)
 
-
         target = data['y']
         # data['x'] = get_features_by_keys(data, cfg.feature_keys)
         # data2['x'] = get_features_by_keys(data2, cfg.feature_keys)
@@ -597,9 +608,12 @@ def train_one_epoch(model, train_loader, globalcriterion, localcriterion, finalc
         '''Curvenet时用的'''
         # logits = model(data['x'], label_one_hot)  # [8,128,4096]
         # logits2 = model(data2['x'], label_one_hot2)  # [8,128,4096]
+        '''Point Transformer、pointconv'''
+        logits = model(data_all)  # [8,128,4096]
+        logits2 = model(data_all2)  # [8,128,4096]
         '''DGCNN、Pointnet、Pointnet2、PCT时用的'''
-        logits = model(data_all, label_one_hot)  # [8,128,4096]
-        logits2 = model(data_all2, label_one_hot2)  # [8,128,4096]
+        # logits = model(data_all, label_one_hot)  # [8,128,4096]
+        # logits2 = model(data_all2, label_one_hot2)  # [8,128,4096]
         '''GDANet、PointMLP使用'''
         # logits = model(data['pos'], data['x'], label_one_hot)
         # logits2 = model(data2['pos'], data2['x'], label_one_hot2)
@@ -660,12 +674,12 @@ def train_one_epoch(model, train_loader, globalcriterion, localcriterion, finalc
             num_iter = 0
             optimizer.step()
             optimizer.zero_grad()
-            if not cfg.sched_on_epoch:
+            if not cfg.sched_on_epoch and epoch <= cfg.epochs:
                 scheduler.step(epoch)
 
         loss_meter.update(loss.item(), n=batch_size)
         if idx % cfg.print_freq:
-            pbar.set_description(f"Train Epoch [{epoch}/{cfg.epochs}] "
+            pbar.set_description(f"Train Epoch [{epoch}] "
                                  f"Loss {loss_meter.avg:.3f} ")  #loss_meter.avg
 
         record_iter_train['loss'].append(loss_meter.avg)  # loss_meter.avg
@@ -803,12 +817,12 @@ def train_one_epoch_pointstak(model, train_loader, globalcriterion, localcriteri
             num_iter = 0
             optimizer.step()
             optimizer.zero_grad()
-            if not cfg.sched_on_epoch:
+            if not cfg.sched_on_epoch and epoch <= cfg.epochs:
                 scheduler.step(epoch)
 
         loss_meter.update(loss.item(), n=batch_size)
         if idx % cfg.print_freq:
-            pbar.set_description(f"Train Epoch [{epoch}/{cfg.epochs}] "
+            pbar.set_description(f"Train Epoch [{epoch}] "
                                  f"Loss {loss_meter.avg:.3f} ")  # loss_meter.avg
 
         record_iter_train['loss'].append(loss_meter.avg)  # loss_meter.avg
@@ -911,7 +925,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser('ShapeNetPart Part segmentation training')
     #  pointnet_default.yaml  pointnet2_default.yaml（point_transformer用这个）    dgcnn.yaml    GDANet_default.yaml
     #  pointmlp_default.yaml  curvenet_default.yaml    pointstack_default.yaml   spotr_default.yaml  pointnext_default.yaml
-    parser.add_argument('--cfg', type=str, default="../../cfgs/shapenetpart/dgcnn.yaml", help='config file')
+    parser.add_argument('--cfg', type=str, default="../../cfgs/shapenetpart/pointconv.yaml", help='config file')
     args, opts = parser.parse_known_args()
    #args.cfg = "D:/pythonproject/Pointnext/cfgs/shapenetpart/default.yaml"
     cfg = EasyConfig()
@@ -960,14 +974,14 @@ if __name__ == "__main__":
     cfg.wandb.name = cfg.run_name
 
 
-    main(0, cfg)
+    # main(0, cfg)
     # multi processing.
-    # if cfg.mp:
-    #     port = find_free_port()
-    #     cfg.dist_url = f"tcp://localhost:{port}"
-    #     print('using mp spawn for distributed training')
-    #     mp.spawn(main, nprocs=cfg.world_size, args=(cfg,))
-    # else:
-    #     main(0, cfg)
+    if cfg.mp:
+        port = find_free_port()
+        cfg.dist_url = f"tcp://localhost:{port}"
+        print('using mp spawn for distributed training')
+        mp.spawn(main, nprocs=cfg.world_size, args=(cfg,))
+    else:
+        main(0, cfg)
 
 
