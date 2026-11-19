@@ -1,0 +1,70 @@
+运行不同的模型时：
+pointmlp、pointnext、pointnet++、DGCNN、pointnet、PCT可以用同一个shapenetpart
+
+
+=========================== 阶段一：自监督 =========================
+    1.cfg文件为：pointnet2default.yaml
+       修改方法：train: [PointsToTensor,  PointCloudXYZAlign, PointCloudRotation]   # 自监督时使用
+                 train: [PointsToTensor,  PointCloudXYZAlign]  #全监督时使用
+
+    2.损失函数为：.\datautils\SelfSuperviseLoss.py
+
+    3.修改base_seg中：is_supervise（is_selfsupervise）
+      修改方法：is_selfsupervise=False # 不进行自监督；		
+               is_selfsupervise=Ture # 进行自监督
+      地址=.\openpoints\models\segmentation\base_seg.py
+
+    4.参数配置文件更改：修改datatransformer
+       文件含义：shapenetpart_superivised.py表示监督学习时所用的代码，shapenetpart_unsupervised.py表示无监督学习时所用的代码
+       dataset文件地址=".\openpoints\dataset\shapenetpart\"
+	     修改方法：self_supervise_shapenetpart.py每次运行时将名字修改为shapenetpart.py
+	    
+    5.修改模型中的分割头models:backbone
+
+=========================== 阶段二：半监督 =========================
+    半监督时，将其中的ShapeNetPartNormal函数中的”if len(data) != 4096:“ 改为”if len(data) != 点数:“
+
+
+=========================== 阶段二：半监督 =========================
+
+-------------------- 1.PointNext --------------------
+----cfg文件为：mydatacfgs.yaml
+----dataset文件为：pointnext_shapenetpart.py每次运行时将名字修改为shapenetpart.py
+"D:\a-project-T\Pointnext\openpoints\dataset\shapenetpart\"
+----models:PointNext
+----pointnext_main.py
+
+-------------------- 2.PointNet2 --------------------
+----cfg文件为：pointnet2_default.yaml
+----dataset文件为：pointnet2_shapenetpart.py每次运行时将名字修改为shapenetpart.py
+"D:\a-project-T\Pointnext\openpoints\dataset\shapenetpart\"
+----models:backbone\pointnetv2.py
+----pointnext_main.py
+
+-------------------- 3.PointMlp --------------------
+----cfg文件为：pointmlp_default.yaml
+----dataset文件为：pointmlp_shapenetpart.py每次运行时将名字修改为shapenetpart.py
+"D:\a-project-T\Pointnext\openpoints\dataset\shapenetpart\"
+----models:backbone\pointmlp
+----pointmlp_main.py
+
+-------------------- 4.DGCNN --------------------
+----cfg文件为：pointnet2default.yaml
+----dataset文件为：每次运行时将名字修改为shapenetpart.py
+"D:\a-project-T\Pointnext\openpoints\dataset\shapenetpart\"
+----models:backbone\dgcnn
+----dgcnn_main.py
+
+-------------------- 5.pct --------------------
+----cfg文件为：pointnet2default.yaml
+----dataset文件为：每次运行时将名字修改为shapenetpart.py
+"D:\a-project-T\Pointnext\openpoints\dataset\shapenetpart\"
+----models:backbone\pct
+----dgcnn_main.py
+
+-------------------- 6.PointConv --------------------
+----cfg文件为：pointconv.yaml
+----dataset文件为：每次运行时将名字修改为shapenetpart.py
+"D:\a-project-T\Pointnext\openpoints\dataset\shapenetpart\"
+----models:".\openpoints\models\pointconv"
+----pointconv.py
