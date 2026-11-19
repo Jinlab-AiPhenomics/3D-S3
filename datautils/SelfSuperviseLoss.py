@@ -22,15 +22,140 @@ class TotalCodingRate(nn.Module):
         p, m = W.shape  # [d, B]
         m = self.b
         I = torch.eye(p, device=W.device)
-        scalar = p / (m * self.eps)
+        scalar = p / (m * (self.eps * self.eps))
         logdet = torch.logdet(I + scalar * W.matmul(W.T))
         return logdet / 2.
 
     def forward(self, X):
         return - self.compute_discrimn_loss(X.T)
 
-# 余弦相似度
+# 软余弦相似度
 class Similarity_Loss(nn.Module):
+    def __init__(self, blend_with_eye: float = 0.1, eps: float = 1e-8, clamp_nonneg: bool = True):
+        """
+        blend_with_eye: 将 S 与单位阵做线性混合，数值稳定且防止奇异（S = (1-a)*S + a*I）
+        clamp_nonneg  : 是否将 S 截断为非负，避免少量负相似度带来的不稳定
+        eps           : 数值稳定项
+        """
+        super().__init__()
+        self.blend_with_eye = blend_with_eye
+        self.eps = eps
+        self.clamp_nonneg = clamp_nonneg
+
+    @torch.no_grad()
+    def _build_feature_similarity(self, Z: torch.Tensor) -> torch.Tensor:
+        """
+        基于当前批次在特征维度构建 S（D×D）：
+        S_ij = cos(第 i 个特征列, 第 j 个特征列)
+        Z: [N, D]
+        """
+        # 列向量为特征在不同 patch 上的响应
+        # Gram 矩阵
+        G = Z.transpose(0, 1) @ Z  # [D, D]
+        # 列范数
+        col_norm = torch.sqrt(torch.sum(Z * Z, dim=0) + self.eps)  # [D]
+        denom = torch.outer(col_norm, col_norm) + self.eps         # [D, D]
+        S = G / denom                                              # 归一化为特征间 cosine
+
+        if self.clamp_nonneg:
+            S = torch.clamp(S, min=0.0)                            # 可选：仅保留非负相似
+
+        # 与单位阵混合，增强数值稳定
+        if self.blend_with_eye > 0:
+            D = S.size(0)
+            S = (1.0 - self.blend_with_eye) * S + self.blend_with_eye * torch.eye(D, device=Z.device, dtype=Z.dtype)
+        return S
+
+    def forward(self, z_list, z_avg=None):
+        Z = torch.stack(list(z_list), dim=0)
+
+        if z_avg is None:
+            z_avg = Z.mean(dim=0)
+
+        # 支持两个分支的逐点特征比较
+        if z_avg.dim() == 2:
+            assert z_avg.shape == Z.shape, "两个分支特征形状必须一致"
+            S = self._build_feature_similarity(Z)
+            ZS = Z @ S
+            YS = z_avg @ S
+            numer = torch.sum(ZS * z_avg, dim=1)
+            norm_z = torch.sum(ZS * Z, dim=1)
+            norm_y = torch.sum(YS * z_avg, dim=1)
+            denom = torch.sqrt(torch.clamp(norm_z * norm_y, min=0.0) + self.eps)
+            softcos = numer / denom
+            z_sim = softcos.mean()
+
+            return -z_sim, z_sim.detach()
+
+        # 保留原来的单个平均特征向量计算方式
+        z_avg = z_avg.reshape(-1)
+        assert z_avg.numel() == Z.shape[1]
+
+        S = self._build_feature_similarity(Z)
+        Szavg = S @ z_avg
+        ZS = Z @ S
+        numer = torch.sum(Z * Szavg.unsqueeze(0), dim=1)
+        norm_avg = torch.sum(z_avg * Szavg) + self.eps
+        norm_z = torch.sum(ZS * Z, dim=1) + self.eps
+
+        denom = torch.sqrt(  torch.clamp(norm_z * norm_avg, min=0.0) + self.eps )
+
+        softcos = numer / denom
+        z_sim = softcos.mean()
+
+        return -z_sim, z_sim.detach()
+
+
+        # 保留原来的单个平均特征向量计算方式
+        z_avg = z_avg.reshape(-1)
+        assert z_avg.numel() == Z.shape[1]
+
+        S = self._build_feature_similarity(Z)
+
+        Szavg = S @ z_avg
+        ZS = Z @ S
+
+        numer = torch.sum(Z * Szavg.unsqueeze(0), dim=1)
+
+        norm_avg = torch.sum(z_avg * Szavg) + self.eps
+        norm_z = torch.sum(ZS * Z, dim=1) + self.eps
+
+        denom = torch.sqrt( torch.clamp(norm_z * norm_avg, min=0.0) + self.eps )
+
+        softcos = numer / denom
+        z_sim = softcos.mean()
+
+        return -z_sim, z_sim.detach()
+
+
+# 全局相似度： SCS-inspired 聚合形式
+class GlobalSCSLoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, branch_a, branch_b):
+        # 两个分支必须具有相同的 [B, N, C] 形状，且点索引一一对应。
+        if branch_a.shape != branch_b.shape or branch_a.ndim != 3:
+            raise ValueError('GlobalSCSLoss expects matching [B, N, C] tensors')
+        a = F.normalize(branch_a, p=2, dim=-1, eps=self.eps)  # S1
+        b = F.normalize(branch_b, p=2, dim=-1, eps=self.eps)  # S2
+        cosine = (a * b).sum(dim=-1)                          # S3, [B, N]
+        # 附录 S4 假定对应点相似度非负；将负值截断并显式处理零分母。
+        sim = cosine.clamp(min=0.0)
+        norm_a_sq = (a * a).sum(dim=-1)
+        norm_b_sq = (b * b).sum(dim=-1)
+        numerator = (sim.square()).sum(dim=-1)
+        denom_a = (sim * norm_a_sq).sum(dim=-1)
+        denom_b = (sim * norm_b_sq).sum(dim=-1)
+        denominator = torch.sqrt(denom_a.clamp_min(0) * denom_b.clamp_min(0))
+        scs = numerator / denominator.clamp_min(self.eps)  # S4, [B]
+        # 损失采用 1-SCS：非负，最小化时最大化跨分支相似度。
+        return (1.0 - scs).mean(), scs.mean().detach()
+
+
+# 余弦相似度
+class Similarity_Loss_cosine(nn.Module):
     def __init__(self, ):
         super().__init__()
         pass
@@ -310,6 +435,64 @@ def davies_bouldin(X, labels):
     return D_B
 
 # 监督损失  全局损失
+@torch.no_grad()
+def fused_kmeans(pos, fea, K, max_iter=301, tolerance=1e-5, patience=5):
+    """空间 FPS 初始化，位置分组后在 XYZ+语义特征空间迭代。"""
+    pos = pos.detach().float()
+    X = torch.cat((pos, fea.detach().float()), dim=-1)
+    K = min(K, len(X))
+    # 使用空间距离进行 FPS，保证选中的索引不重复。
+    selected = torch.zeros(len(pos), dtype=torch.bool, device=pos.device)
+    distances = torch.full((len(pos),), float('inf'), device=pos.device)
+    index = ((pos - pos.mean(0)) ** 2).sum(-1).argmax()
+    seeds = []
+    for _ in range(K):
+        seeds.append(index)
+        selected[index] = True
+        distances = torch.minimum(distances, ((pos - pos[index]) ** 2).sum(-1))
+        index = distances.masked_fill(selected, -1).argmax()
+    seeds = torch.stack(seeds)
+    labels = torch.cdist(pos, pos[seeds]).argmin(1)
+    centers = X[seeds].clone()
+    previous = None
+    stale = 0
+    for _ in range(max_iter):
+        for k in range(K):
+            members = X[labels == k]
+            if len(members):
+                centers[k] = members.mean(0)
+            else:
+                residual = torch.cdist(X, centers).min(1).values
+                centers[k] = X[residual.argmax()]
+        labels = torch.cdist(X, centers).argmin(1)
+        sse = ((X - centers[labels]) ** 2).sum().item()
+        if previous is not None:
+            improvement = (previous - sse) / max(abs(previous), 1e-12)
+            stale = stale + 1 if 0 <= improvement < tolerance else 0
+            if stale >= patience:
+                break
+        previous = sse
+    return labels
+
+
+def intercluster_soft_cosine(fea, labels, alpha=0.1, eps=1e-8):
+    """不同簇的语义中心两两软余弦相似度；最小化以促进分离。"""
+    Z = fea.float()
+    centers = torch.stack([Z[labels == k].mean(0) for k in labels.unique()])
+    if len(centers) < 2:
+        return Z.sum() * 0.0
+    with torch.no_grad():
+        columns = F.normalize(Z.detach(), dim=0, eps=eps)
+        # Gram 矩阵为半正定；不逐元素截断，避免破坏该性质。
+        S = (1 - alpha) * (columns.T @ columns) + alpha * torch.eye(
+            Z.shape[1], device=Z.device, dtype=Z.dtype)
+    gram = (centers @ S) @ centers.T
+    norms = gram.diag().clamp_min(eps).sqrt()
+    similarity = (gram / (norms[:, None] * norms[None, :])).clamp(-1, 1)
+    i, j = torch.triu_indices(len(centers), len(centers), offset=1, device=Z.device)
+    return similarity[i, j].mean()
+
+
 class My_super_loss_kmeans2(nn.Module):
 
     def __init__(self, bs):
@@ -330,11 +513,13 @@ class My_super_loss_kmeans2(nn.Module):
         self.b = bs  # 8
         self.n = None  # 4096
         self.c = None  # 128
-        self.contractive_loss = Similarity_Loss()
+        self.contractive_loss = Similarity_Loss()  # 保留原有 KNN 组内损失
+        self.global_scs_loss = GlobalSCSLoss()  # 用于全局损失
 
         self.K = 5  # K-Means聚类的中心点数量
-        self.max_iter = 100  # K-Means聚类的最大迭代次数
-        self.tolerance = 0.001  # 簇内误方差SSE的阈值，小于该阈值时，迭代中止
+        self.max_iter = 301  # K-Means聚类的最大迭代次数
+        self.tolerance = 0.00001  # 簇内误方差SSE的阈值，小于该阈值时，迭代中止
+        self.patience = 10  # 连续5次改善不足则提前终止
 
         self.criterion = TotalCodingRate(self.b, eps=0.2)
 
@@ -348,23 +533,15 @@ class My_super_loss_kmeans2(nn.Module):
         torch.autograd.set_detect_anomaly(True)
 
         ##########global points loss 计算两个分支的余弦相似度#####################
-        globalpointloss = 0
-        for index in range(self.b):
-            data = logits[index]  # [4096, 128]   [N, C]
-            data1 = logits1[index]  # [4096, 128]   [N, C]
-            globalpointloss += F.cosine_similarity(data, data1, dim=1).mean()  # 计算两个分支的余弦相似度
-
-        globalpointloss = globalpointloss / self.b
-        globalpointloss = -globalpointloss  # -0.1934
+        # 直接批量计算，内部按样本聚合后对 batch 取平均；无遗漏累加或二次取负。
+        globalpointloss, global_scs = self.global_scs_loss(logits, logits1)
         print('globalpointloss:', globalpointloss)
 
         ##########FPS 下采样 #####################
         idx = self.sample_fn(p0first, self.downsample).long()  # # 最远点采样，下采样后新的索引   [8, 256]    [B, N]      tensor
         idx1 = self.sample_fn(p0sec, self.downsample).long()  # # 最远点采样，下采样后新的索引   [8, 256]    [B, N]      tensor
-        new_p = torch.gather(p0first, 1,
-                             idx.unsqueeze(-1).expand(-1, -1, 3))  # 下采样后新的坐标     [8,256,3]    [B, N, C]      tensor
-        new_p1 = torch.gather(p0sec, 1,
-                              idx1.unsqueeze(-1).expand(-1, -1, 3))  # 下采样后新的坐标     [8,256,3]    [B, N, C]      tensor
+        new_p = torch.gather(p0first, 1, idx.unsqueeze(-1).expand(-1, -1, 3))  # 下采样后新的坐标     [8,256,3]    [B, N, C]      tensor
+        new_p1 = torch.gather(p0sec, 1, idx1.unsqueeze(-1).expand(-1, -1, 3))  # 下采样后新的坐标     [8,256,3]    [B, N, C]      tensor
 
         logits = logits.permute(0, 2, 1)  # 输入的特征  [8,128,4096]    [B, C, N]        p0first = [8,4096,3]      tensor
         logits1 = logits1.permute(0, 2, 1)  # 输入的特征  [8,128,4096]    [B, C, N]        p0sec = [8,4096,3]        tensor
@@ -372,131 +549,16 @@ class My_super_loss_kmeans2(nn.Module):
         fi1 = torch.gather(logits1, -1, idx1.unsqueeze(1).expand(-1, logits1.shape[1], -1))  # fi b c n   采样后的特征，对应new_p1   [8,128,256]    [B, C, N]      tensor
 
 
-        ##########  K-Means聚类，计算类间损失  #####################
-        groupinnerloss_k = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-        groupinnerloss_k_1 = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-        groupouterloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-        groupouterloss_1 = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-        for index in range(self.b):
-            pos = new_p[index]  # [256, 3]    [N, C]
-            pos1 = new_p1[index]  # [256, 3]    [N, C]
-            fea = fi.permute(0, 2, 1)[index]  # [256, 128]  [N, C]         fi = [8,256,128]    [B, N, C]
-            fea1 = fi1.permute(0, 2, 1)[index]  # [256, 128]  [N, C]
-
-            centroids_idx = InitialCentroid(pos, self.K)  # 分支一：[20, 3] 用K-Means++方法初始化选择聚类中心    centroids_idx = [K, 3]([K, 1, 3])
-            centroids_idx_1 = InitialCentroid(pos1, self.K)  # 分支二：
-            # idx = None                                         # 初始化样本点的索引
-            idx = findClostestCentroids(pos, centroids_idx)  # [256] 计算每个样本点的最近簇中心点,返回到中心点的索引
-            idx_1 = findClostestCentroids(pos1, centroids_idx_1)  # 分支二：
-
-            centroids_idx, sse_n = computeCentroids(pos, centroids_idx, idx, self.K, self.criterion)  # [20, 3] 重新计算每个簇的样本中心点
-            centroids_idx_1, sse_n_1 = computeCentroids(pos1, centroids_idx_1, idx_1, self.K, self.criterion)  # [20, 3] 重新计算每个簇的样本中心点
-
-            new_feature = torch.cat((pos, fea), dim=-1)  # [256, 131] 拼接XYZ特征和feature特征为新的高维特征    [N, C]
-            new_feature_1 = torch.cat((pos1, fea1), dim=-1)  # [256, 131] 拼接XYZ特征和feature特征为新的高维特征    [N, C]
-
-            # 分支一：聚类结果，找到该样本中心点在高维特征中的对应的索引
-            sse_pre = 0
-            for i in range(self.max_iter):
-                prev_centers = centroids_idx  # 保存上一轮的簇中心点的数据
-                idx = findClostestCentroids(fea, centroids_idx)  # 计算每个样本点的最近簇中心点
-                centroids_idx, sse_curr = computeCentroids(fea, centroids_idx, idx, self.K,
-                                                                                 self.criterion)  # 重新计算每个簇的样本中心点，返回中心点坐标
-                # '中心点'是否在误差范围
-                ''' # 只利用前后两个中心点的变化作为sse
-                q = (prev_centers - centroids_idx)                  # 计算sse损失
-                w = (prev_centers - centroids_idx) ** 2             # 计算sse损失
-                sse = torch.sum((prev_centers - centroids_idx) ** 2)  # 计算sse损失
-                sse[torch.isnan(sse)] = 0  '''
-                if sse_pre is not None and abs(sse_curr - sse_pre) < self.tolerance:
-                    break
-                sse_pre = sse_curr
-
-            # 分支二：聚类结果，找到该样本中心点在高维特征中的对应的索引
-            sse_pre_1 = 0
-            for j in range(self.max_iter):
-                prev_centers_1 = centroids_idx_1  # 保存上一轮的簇中心点的数据
-                idx_1 = findClostestCentroids(fea1, centroids_idx_1)  # 计算每个样本点的最近簇中心点
-                centroids_idx_1, sse_curr_1 = computeCentroids(fea1, centroids_idx_1, idx_1,
-                                                                                         self.K,
-                                                                                         self.criterion)  # 重新计算每个簇的样本中心点，返回中心点坐标
-                # '中心点'是否在误差范围
-                if sse_pre_1 is not None and abs(sse_curr_1 - sse_pre_1) < self.tolerance:
-                    break
-                sse_pre_1 = sse_curr_1
-
-            '''  Silhouette Score：衡量每个样本点到其簇内样本的距离与其最近簇结构之间距离的比值
-                     比值越小，说明该样本点所在的簇结构与其最近簇结构之间的距离越远，聚类结果越好。(接近1表簇类紧密度高，与相邻簇分离度高[-1,1])
-                 Calinski-Harabasz Index：簇间距离与簇内距离的比值，衡量簇类的紧密度与簇间的分离度，取值越高，聚类效果越好，最大化index
-                 Davies-Bouldin Index：计算每个簇与最相似簇之间相似度.簇与簇之间的相似度越高（DB指数偏高），
-                   簇与簇之间的距离越小（直观上理解只有相距越近的事物才会约相似），聚类结果就越好'''
-
-            '''方法一：利用sklearn，实现计算轮廓系数、C_H系数和D_B系数三个指标函数的代码'''
-            new_feature_c_1, idx_c_1 = new_feature_1.cpu(), idx_1.cpu()  # 将gpu向量转为cpu向量上
-            new_feature_n_1, idx_n_1 = new_feature_c_1.detach().numpy(), idx_c_1.detach().numpy()  # 将cpu向量转为numpy数组
-            new_feature_c, idx_c = new_feature.cpu(), idx.cpu()  # 将gpu向量转为cpu向量上
-            new_feature_n, idx_n = new_feature_c.detach().numpy(), idx_c.detach().numpy()  # 将cpu向量转为numpy数组
-
-            fea_c_1, idx_c_1 = fea1.cpu(), idx_1.cpu()  # 将gpu向量转为cpu向量上
-            fea_n_1, idx_n_1 = fea_c_1.detach().numpy(), idx_c_1.detach().numpy()  # 将cpu向量转为numpy数组
-            fea_c, idx_c = fea.cpu(), idx.cpu()  # 将gpu向量转为cpu向量上
-            fea_n, idx_n = fea_c.detach().numpy(), idx_c.detach().numpy()  # 将cpu向量转为numpy数组
-
-            # silhouette = silhouette_score(new_feature_n, idx_n)
-            # silhouette[torch.isnan(silhouette)] = 0
-            # calinski = calinski_harabasz_score(fea_n, idx_n)
-            # davies = davies_bouldin_score(fea_n, idx_n)
-
-            # silhouette_1 = silhouette_score(new_feature_n_1, idx_n_1)
-            # calinski_1 = calinski_harabasz_score(new_feature_n_1, idx_n_1)
-            # davies_1 = davies_bouldin_score(new_feature_n_1, idx_n_1)
-
-            '''方法二：利用python代码，实现计算轮廓系数、C_H系数和D_B系数三个指标函数的代码'''
-            # S_C = silhouette_coefficient(new_feature, idx)  # S_C(-1, 1)，1表示聚类效果最好
-            # S_C = 1 - (S_C + 1) / 2  # 将原始轮廓系数做一个线性变换，值越小表示效果越好
-            # C_H = calinski_harabasz(fea, idx)  # C_H(0,无穷大)，值越大表示聚类效果越好
-            with torch.no_grad():
-                C_H = calinski_harabasz(fea, idx)
-                C_H = torch.tensor(C_H)
-                if torch.isnan(C_H).any():
-                    C_H = C_H.detach()
-                    nan_indices = torch.isnan(C_H)  # 检查是否有 NaN 值
-                    C_H[nan_indices] = 0
-                    print('C_H:',C_H)
-                    print(f"Skipping iteration {index} because C_H value is NaN")
-            # C_H = calinski_harabasz(new_feature, idx)  # C_H(0,无穷大)，值越大表示聚类效果越好
-            C_H = 1 / (1 + C_H)  # 将D_B系数做一个线性变换，值越小表示效果越好
-            # D_B = davies_bouldin(fea, idx)  # D_B(0,无穷大)，值越小表示聚类效果越好
-            # D_B = davies_bouldin(new_feature, idx)  # D_B(0,无穷大)，值越小表示聚类效果越好
-
-            # S_C_1 = silhouette_coefficient(new_feature_1, idx_1)  # S_C(-1, 1)，1表示聚类效果最好
-            # S_C_1 = 1 - (S_C_1 + 1) / 2  # 将原始轮廓系数做一个线性变换，值越小表示效果越好
-            # C_H_1 = calinski_harabasz(fea1, idx_1)  # C_H(0,无穷大)，值越大表示聚类效果越好
-            with torch.no_grad():
-                C_H_1 = calinski_harabasz(fea1, idx_1)
-                C_H_1 = torch.tensor(C_H_1)
-                if torch.isnan(C_H_1).any():
-                    C_H_1 = C_H_1.detach()
-                    nan_indices_1 = torch.isnan(C_H_1)  # 检查是否有 NaN 值
-                    C_H_1[nan_indices_1] = 0
-                    print('C_H_1:',C_H_1)
-                    print(f"Skipping iteration {index} because C_H value is NaN")
-            # C_H_1 = calinski_harabasz(new_feature_1, idx_1)  # C_H(0,无穷大)，值越大表示聚类效果越好
-            C_H_1 = 1 / (1 + C_H_1)  # 将D_B系数做一个线性变换，值越小表示效果越好
-            # D_B_1 = davies_bouldin(fea1, idx_1)  # D_B(0,无穷大)，值越小表示聚类效果越好
-            # D_B_1 = davies_bouldin(new_feature_1, idx_1)  # D_B(0,无穷大)，值越小表示聚类效果越好
-
-            groupouterloss += C_H  # 分支一：在KMeans方法中计算类间相似度
-            groupouterloss_1 += C_H_1  # 分支一：在KMeans方法中计算类间相似度
-
-            # groupinnerloss_k += 200 * similarity + 1 * loss_TCR  # 分支一：在KMeans方法中计算类间相似度
-            # groupinnerloss_k_1 += 200 * similarity_1 + 1 * loss_TCR_1  # 分支一：在KMeans方法中计算类间相似度
-
-        groupouterloss = ((groupouterloss + groupouterloss_1) / 2) / self.b
+        ########## 融合特征聚类与软余弦类间分离 ##########
+        outer_losses = []
+        for index in range(b):
+            for pos, fea in ((new_p[index], fi[index].transpose(0, 1)),
+                             (new_p1[index], fi1[index].transpose(0, 1))):
+                labels = fused_kmeans(pos, fea, self.K, self.max_iter,
+                                      self.tolerance, self.patience)
+                outer_losses.append(intercluster_soft_cosine(fea, labels))
+        groupouterloss = torch.stack(outer_losses).mean()
         print('groupouterloss:', groupouterloss)
-        # groupinnerloss_k = ((groupinnerloss_k + groupinnerloss_k_1) / 2) / self.b
-        # print('groupinnerloss_k:', groupinnerloss_k)
-
 
         ##########  KNN分组  #####################
         # dp, fj = self.grouper(new_p, p0first, logits)  #fj b c n k    fj    p0first = [8,4096,3]     KNN分组
@@ -513,7 +575,7 @@ class My_super_loss_kmeans2(nn.Module):
 
         ##################groupinnerloss  计算KNN分组后的组内损失####################
         groupinnerloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-        for index in range(self.b):
+        for index in range(b):
             fii = fi[index]  # [256, 128] [N, C]         fi = [8,256,128]    [B, N, C]
             fjj = fj[index]  # [256, 32, 128] [N, S, C]  fj =  [8,256,32,128]    [B, N, S, C]
             fii1 = fi1[index]  # [256, 128] [N, C]
@@ -527,7 +589,7 @@ class My_super_loss_kmeans2(nn.Module):
                 avg = datatemp.mean(0)  # 128
                 loss_contract, _ = self.contractive_loss(datatemp, avg)  # 计算两个分支的相似度
                 loss_TCR = cal_TCR(datatemp, self.criterion, len(datatemp))  # 计算正则
-                groupinnerloss += 200 * loss_contract + 1 * loss_TCR
+                groupinnerloss = groupinnerloss + 200 * loss_contract + 1 * loss_TCR
 
             for pointindex, points in enumerate(fii1):
                 datatemp = torch.unsqueeze(points, 0)
@@ -535,11 +597,10 @@ class My_super_loss_kmeans2(nn.Module):
                 avg = datatemp.mean(0)
                 loss_contract, _ = self.contractive_loss(datatemp, avg)
                 loss_TCR = cal_TCR(datatemp, self.criterion, len(datatemp))
-                groupinnerloss += 200 * loss_contract + 1 * loss_TCR
+                groupinnerloss = groupinnerloss + 200 * loss_contract + 1 * loss_TCR
 
-            groupinnerloss = groupinnerloss / self.downsample
 
-        groupinnerloss = groupinnerloss / self.b
+        groupinnerloss = groupinnerloss / (b * self.downsample)
         print('groupinnerloss:', groupinnerloss)
 
         ##################grouploss####################
@@ -574,7 +635,7 @@ class My_super_loss_kmeans2_1(nn.Module):
         self.contractive_loss = Similarity_Loss()
 
         self.K = 5              # K-Means聚类的中心点数量
-        self.max_iter = 100      # K-Means聚类的最大迭代次数
+        self.max_iter = 301      # K-Means聚类的最大迭代次数
         self.tolerance  =0.001         # 簇内误方差SSE的阈值，小于该阈值时，迭代中止
 
         self.criterion = TotalCodingRate(self.b, eps=0.2)
@@ -1042,123 +1103,7 @@ class ChamferLoss(nn.Module):
         self.b = b
         self.n = n
         self.c = c
-
-       #  groupdisloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-       #  for pcpos in matrix1[0:, :, :]:
-       #     for index,tensors in enumerate(pcpos):
-       #         if index < len(pcpos)-1:
-       #             datatemp = torch.unsqueeze(tensors,0)
-       #             inner_product = torch.mm(datatemp, pcpos[(index+1):,:].t())
-       #             norms1 = torch.norm(datatemp, dim=1)
-       #             norms2 = torch.norm(pcpos[(index+1):,:], dim=1)
-       #             similar_matrix = inner_product / torch.mm(norms1.view(-1, 1), norms2.view(1, -1))
-       #             similar_matrix[similar_matrix > 1] = 1.0
-       #             similar_matrix = torch.pow(torch.abs(similar_matrix),2)
-       #             #print(torch.min(similar_matrix))
-       #             groupdisloss = groupdisloss + torch.sum(similar_matrix)
-       #             #groupdisloss = groupdisloss + torch.min(similar_matrix)
-       #
-       #
-       #  for pcpos in matrix2[0:, :, :]:
-       #     for index,tensors in enumerate(pcpos):
-       #         if index < len(pcpos)-1:
-       #             datatemp = torch.unsqueeze(tensors,0)
-       #             inner_product = torch.mm(datatemp, pcpos[(index+1):,:].t())
-       #             norms1 = torch.norm(datatemp, dim=1)
-       #             norms2 = torch.norm(pcpos[(index+1):,:], dim=1)
-       #             similar_matrix = inner_product / torch.mm(norms1.view(-1, 1), norms2.view(1, -1))
-       #             #similar_matrix = torch.pow(torch.abs(similar_matrix),2)
-       #             similar_matrix[similar_matrix > 1] = 1.0
-       #             similar_matrix = torch.pow(torch.abs(similar_matrix), 2)
-       #             groupdisloss = groupdisloss + torch.sum(similar_matrix)
-       #             #groupdisloss = groupdisloss + torch.min(similar_matrix)
-       #
-       # # groupdisloss = (groupdisloss / (n * (n-1))) / b
-       #  groupdisloss = (groupdisloss / ((self.n) * ((self.n) - 1))) / self.b
-       #  #groupdisloss = (groupdisloss / (n - 1)) / b
-
-
-
-
-
-
-
-
-
-
-       # matrix1 = F.normalize(matrix1, dim=2)
-        #matrix2 = F.normalize(matrix2, dim=2)
-
-
         loss = torch.tensor(0, dtype=torch.float32,requires_grad=True).cuda()
-        ##############  归一化欧式距离
-        # for index, pcpos in enumerate(matrix1[0:,:,:]):
-        #
-        #     plyloss = torch.tensor(0, dtype=torch.float32).cuda()
-        #
-        #     for index1, point in enumerate(pcpos[0:,:]):
-        #
-        #
-        #             dis = torch.sqrt(torch.sum(torch.square(point-matrix2[index,:,:]),dim=1))  #欧氏距离
-        #             #dis = torch.sum(torch.abs(point - matrix2[index, :, :]), dim=1)  #曼哈顿距离
-        #             dis = 1 / (1 + dis)
-        #             plyloss = torch.add(plyloss,torch.min(dis))
-        #
-        #     loss = torch.add(loss,plyloss / n)
-        #
-        #
-        # for index, pcpos in enumerate(matrix2[0:, :, :]):
-        #
-        #     plyloss = torch.tensor(0, dtype=torch.float32).cuda()
-        #
-        #     for index1, point in enumerate(pcpos[0:, :]):
-        #         dis = torch.sqrt(torch.sum(torch.square(point - matrix1[index, :, :]), dim=1))  #欧氏距离
-        #         #dis = torch.sum(torch.abs(point - matrix1[index, :, :]), dim=1)  #曼哈顿距离
-        #         dis = 1 / (1 + dis)
-        #         plyloss = torch.add(plyloss, torch.min(dis))
-        #
-        #     loss = torch.add(loss, plyloss / n)
-        ##############  归一化欧式距离
-
-
-
-            # prod = torch.mm(pcpos, matrix2[index,:,:].t())  # 分子
-            # norm1 = torch.norm(pcpos, p=2, dim=1).unsqueeze(1)  # 分母
-            # norm2 = torch.norm(matrix2[index,:,:], p=2, dim=1).unsqueeze(0)  # 分母
-            # #print(torch.mm(norm2.t(), norm1).shape)
-            # similar_matrix = prod.div(torch.mm(norm1,norm2))
-            #print(similar_matrix)
-           # print(cos.shape)
-
-            # dis = torch.dist(pcpos,matrix2[index,:,:])
-            # print(dis.shape)
-           # pcpos = pcpos
-           # anpcpos = matrix2[index,:,:]
-
-            # inner_product = torch.mm(pcpos,anpcpos.t())
-            # norms1 = torch.norm(pcpos,dim=1)
-            # norms2 = torch.norm(anpcpos, dim=1)
-            # similar_matrix = inner_product / torch.mm(norms1.view(-1,1),norms2.view(1,-1))
-
-
-
-            #similar_matrix = torch.mm((pcpos / torch.norm(pcpos, dim=-1, keepdim=True)), (matrix2[index,:,:] / torch.norm(matrix2[index,:,:], dim=-1, keepdim=True)).T)  # 矩阵乘法
-
-            #similar_matrix = torch.cosine_similarity(pcpos.unsqueeze(1), matrix2[index,:,:].unsqueeze(0), dim=-1)
-
-
-            # rs = torch.gt(similar_matrix,torch.tensor(1, dtype=torch.float32).cuda())
-            # if True in rs:
-            #     print("error!!!!")
-
-
-
-            # similar_matrix = torch.sub(torch.tensor(1, dtype=torch.float32).cuda(),similar_matrix)
-            # similar_matrix, _ = torch.min(similar_matrix, dim=1)
-            # plyloss1 = torch.div(torch.sum(similar_matrix),torch.tensor(n, dtype=torch.float32).cuda())
-            #print("print(plyloss1)",plyloss1)
-           # loss = torch.add(loss,plyloss1)
-
 
         ##########余弦相似度
         for index, pcpos in enumerate(matrix1[0:,:,:]):
@@ -1177,11 +1122,6 @@ class ChamferLoss(nn.Module):
             similar_matrix, _ = torch.min(similar_matrix, dim=1)
             plyloss1 = torch.div(torch.sum(similar_matrix),torch.tensor(n, dtype=torch.float32).cuda())
             loss = loss + plyloss1
-
-
-
-
-
 
         for index, pcpos in enumerate(matrix2[0:,:,:]):
 
@@ -1211,28 +1151,6 @@ class ChamferLoss(nn.Module):
 
         #return groupdisloss, loss
         return  loss
-
-
-# class Finalloss(nn.Module):
-#
-#     def __init__(self):
-#
-#         super().__init__()
-#         self.w1 = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True)
-#         self.w2 = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True)
-#         self.w3 = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True)
-#
-#         # initialization
-#         self.w1.data.fill_(1.0).cuda()
-#         self.w2.data.fill_(1.0).cuda()
-#         self.w3.data.fill_(1.0).cuda()
-#
-#
-#
-#     def forward(self, globalloss, localloss1, localloss2):
-#
-#         loss = self.w1 * globalloss + self.w2 * localloss1 + self.w3 * localloss2
-#         return loss
 
 
 class MultiLossLayer(nn.Module):
@@ -1313,247 +1231,4 @@ class SegmentLoss(nn.Module):
       factor = 1.0 / 2.0 * self._sigmas_sq[i]
       loss = torch.add(loss, torch.add(torch.multiply(factor, self._loss_list[i]), torch.log(1+self._sigmas_sq[i]) * self._loss_list[i]))
 
-
-
     return loss
-
-
-
-
-# class My_super_loss(nn.Module):
-#
-#     def __init__(self):
-#
-#         super().__init__()
-#         self.sample_fn = furthest_point_sample
-#         group_args = {'NAME': 'ballquery', 'radius': 0.08,  'nsample': 32, 'return_only_idx': False}
-#         self.grouper = create_grouper(group_args)
-#
-#         self.w = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True).cuda()
-#         self.w.data.fill_(0.75).cuda()
-#
-#
-#
-#         self.b = None
-#         self.n = None
-#         self.c = None
-#
-#     def forward(self, logits, logits1,p0first,p0sec):
-#         b,n,c = logits.shape
-#         self.b = b
-#         self.n = n
-#         self.c = c
-#         loss = torch.tensor(0, dtype=torch.float32,requires_grad=True).cuda()
-#         for index in range(len(logits)):
-#             data = logits[index]
-#             data1 = logits1[index]
-#            # datatemp = torch.broadcast_tensors(data[0], data1)[0]
-#             coef = pearsonr(data, data1)
-#             # for i in range(1, len(data)):
-#             #     datatemp = torch.cat((datatemp, pearsonr(torch.broadcast_tensors(data[i], data1)[0], data1)), dim=1)
-#
-#            # coef = datatemp
-#           #  lambd = 3.9e-3
-#            # eyematrix = torch.eye(len(coef)).cuda()
-#             loss = loss + torch.sum(torch.pow((1-coef),2)) / len(coef)
-#             #loss = loss + (torch.sum(lossmatrix) - torch.sum(torch.diagonal(lossmatrix))) * lambd + torch.sum(torch.diagonal(lossmatrix))
-#
-#         loss = loss / len(logits)
-#
-#         #self.tcr = TotalCodingRate(self.n // 16).cuda()
-#
-#
-#         idx = self.sample_fn(p0first, n//16).long()
-#
-#         new_p = torch.gather(p0first, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-#         logits = logits.permute(0,2,1)
-#         fi = torch.gather(logits, -1, idx.unsqueeze(1).expand(-1, logits.shape[1], -1)) # fi b c n
-#
-#         dp, fj = self.grouper(new_p, p0first, logits)  #fj b c n k
-#         fi = fi.permute(0, 2, 1)
-#         fj = fj.permute(0, 2, 3, 1)
-#
-#         groupinnerloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-#         groupdisloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-#
-#         for index in range(b):
-#             fii = fi[index]
-#             fjj = fj[index]
-#
-#             for pointindex,points in enumerate(fii):
-#
-#                 datatemp = torch.unsqueeze(points, 0)
-#                 if index < len(fii) - 1:
-#                     disinner_product = torch.mm(datatemp, fii[(index + 1):, :].t())
-#                     disnorms1 = torch.norm(datatemp, dim=1)
-#                     disnorms2 = torch.norm(fii[(index + 1):, :], dim=1)
-#                     dissimilar_matrix = disinner_product / torch.mm(disnorms1.view(-1, 1), disnorms2.view(1, -1))
-#                     dissimilar_matrix[dissimilar_matrix > 1] = 1.0
-#                     dissimilar_matrix = torch.pow(torch.abs(dissimilar_matrix), 2)
-#                     groupdisloss = groupdisloss + torch.sum(dissimilar_matrix)
-#
-#                 inner_product = torch.mm(datatemp, fjj[pointindex, :, :].t())
-#                 norms1 = torch.norm(datatemp, dim=1)
-#                 norms2 = torch.norm(fjj[pointindex, :, :], dim=1)
-#                 similar_matrix = inner_product / torch.mm(norms1.view(-1, 1), norms2.view(1, -1))
-#                 similar_matrix[similar_matrix > 1] = 1.0
-#                 groupinnerloss = groupinnerloss + torch.sum(torch.pow((1 - similar_matrix),2)) / 32  + torch.sum(torch.abs(points)) * 0.001   #+ self.tcr(fjj[pointindex, :, :])
-#                 #groupinnerloss = groupinnerloss + ((torch.sum(similar_matrix) / 32) * self.w[0] + self.tcr(fjj[pointindex, :, :]))
-#                # print(self.tcr(fjj[pointindex, :, :]))
-#
-#
-#         idx = self.sample_fn(p0sec, n // 16).long()
-#         new_p = torch.gather(p0sec, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-#         logits1 = logits1.permute(0, 2, 1)
-#         fi = torch.gather(logits1, -1, idx.unsqueeze(1).expand(-1, logits1.shape[1], -1))  # fi b c n
-#         dp, fj = self.grouper(new_p, p0sec, logits1)  # fj b c n k
-#         fi = fi.permute(0, 2, 1)
-#         fj = fj.permute(0, 2, 3, 1)
-#         for index in range(b):
-#             fii = fi[index]
-#             fjj = fj[index]
-#             for pointindex, points in enumerate(fii):
-#                 datatemp = torch.unsqueeze(points, 0)
-#
-#                 if index < len(fii) - 1:
-#                     disinner_product = torch.mm(datatemp, fii[(index + 1):, :].t())
-#                     disnorms1 = torch.norm(datatemp, dim=1)
-#                     disnorms2 = torch.norm(fii[(index + 1):, :], dim=1)
-#                     dissimilar_matrix = disinner_product / torch.mm(disnorms1.view(-1, 1), disnorms2.view(1, -1))
-#                     dissimilar_matrix[dissimilar_matrix > 1] = 1.0
-#                     dissimilar_matrix = torch.pow(torch.abs(dissimilar_matrix), 2)
-#                     groupdisloss = groupdisloss + torch.sum(dissimilar_matrix)
-#
-#
-#                 inner_product = torch.mm(datatemp, fjj[pointindex, :, :].t())
-#                 norms1 = torch.norm(datatemp, dim=1)
-#                 norms2 = torch.norm(fjj[pointindex, :, :], dim=1)
-#                 similar_matrix = inner_product / torch.mm(norms1.view(-1, 1), norms2.view(1, -1))
-#                 similar_matrix[similar_matrix > 1] = 1.0
-#                 #groupinnerloss = groupinnerloss + ((torch.sum(similar_matrix) / 32) * self.w[0] + self.tcr(fjj[pointindex, :, :]))
-#                 #groupinnerloss = groupinnerloss + torch.sum(torch.pow((1 - similar_matrix), 2)) / 32 + self.tcr(fjj[pointindex, :, :])
-#                 groupinnerloss = groupinnerloss + torch.sum(torch.pow((1 - similar_matrix), 2)) / 32  + torch.sum(torch.abs(points)) * 0.001
-#                 #print(self.tcr(fjj[pointindex, :, :]))
-#
-#         groupinnerloss = groupinnerloss / ( (self.n // 16) * self.b)
-#         groupdisloss = (groupdisloss / ((self.n // 16) * ((self.n // 16)-1))) / b
-#
-#
-#         return groupdisloss, groupinnerloss, loss
-
-
-'''注释'''
-# class My_super_loss(nn.Module):
-#
-#     def __init__(self):
-#
-#         super().__init__()
-#         self.sample_fn = furthest_point_sample
-#         self.nsample = 8
-#         group_args = {'NAME': 'ballquery', 'radius': 0.08,  'nsample': self.nsample, 'return_only_idx': False}
-#         self.grouper = create_grouper(group_args)
-#
-#         self.w = torch.nn.Parameter(torch.FloatTensor(1), requires_grad=True).cuda()
-#         self.w.data.fill_(0.75).cuda()
-#
-#         self.downsample = None
-#
-#         self.b = None
-#         self.n = None
-#         self.c = None
-#
-#     def forward(self, logits, logits1,p0first,p0sec,orixyz):
-#         b,n,c = logits.shape
-#         self.b = b
-#         self.n = n
-#         self.c = c
-#         self.downsample = self.n // 2
-#         idx = self.sample_fn(orixyz, self.downsample).long()
-#
-#         new_p = torch.gather(p0first, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-#         new_p1 = torch.gather(p0sec, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-#
-#         logits = logits.permute(0,2,1)
-#         logits1 = logits1.permute(0, 2, 1)
-#         fi = torch.gather(logits, -1, idx.unsqueeze(1).expand(-1, logits.shape[1], -1)) # fi b c n
-#         fi1 = torch.gather(logits1, -1, idx.unsqueeze(1).expand(-1, logits1.shape[1], -1))  # fi b c n
-#         dp, fj = self.grouper(new_p, p0first, logits)  #fj b c n k
-#         dp1, fj1 = self.grouper(new_p1, p0sec, logits1)  # fj b c n k
-#         fi = fi.permute(0, 2, 1)
-#         fj = fj.permute(0, 2, 3, 1)
-#         fi1 = fi1.permute(0, 2, 1)
-#         fj1 = fj1.permute(0, 2, 3, 1)
-#         # print(fi.shape)
-#         # print(fi1.shape)
-#         logits = logits.permute(0, 2, 1)
-#         logits1 = logits1.permute(0, 2, 1)
-#
-#         ##########global points loss #####################
-#         globalpointloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-#         globalloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-#         for index in range(self.b):
-#             globaldata,_ = torch.max(fi[index],dim=0)
-#             globaldata1,_ = torch.max(fi1[index], dim=0)
-#             cossim = nn.functional.cosine_similarity(torch.unsqueeze(globaldata, 0),torch.unsqueeze(globaldata1, 0))
-#             globalloss = globalloss + torch.sum(torch.pow((1 - cossim),2))
-#
-#
-#             data = fi[index]
-#             data1 = fi1[index]
-#             coef = nn.functional.cosine_similarity(data,data1,dim=1)
-#             globalpointloss = globalpointloss + torch.sum(torch.pow((1 - coef),2)) / len(coef)
-#
-#
-#
-#         globalpointloss = globalpointloss / self.b
-#         globalloss = globalloss / self.b
-#
-#         ##########global points loss #####################
-#
-#
-#         ##################grouploss####################
-#         crossgroupinnerloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-#         reggroupinnerloss = torch.tensor(0, dtype=torch.float32, requires_grad=True).cuda()
-#
-#         for index in range(self.b):
-#             fii = fi[index]
-#             fjj = fj[index]
-#             fii1 = fi1[index]
-#             fjj1 = fj1[index]
-#
-#
-#             for pointindex,points in enumerate(fii):
-#
-#                 datatemp = torch.unsqueeze(points, 0)
-#                 inner_product = torch.mm(datatemp, fjj1[pointindex, :, :].t())
-#                 norms1 = torch.norm(datatemp, dim=1)
-#                 norms2 = torch.norm(fjj1[pointindex, :, :], dim=1)
-#                 similar_matrix = inner_product / torch.mm(norms1.view(-1, 1), norms2.view(1, -1))
-#                 similar_matrix[similar_matrix > 1] = 1.0
-#                 crossgroupinnerloss = crossgroupinnerloss + torch.sum(torch.pow((1 - similar_matrix),2)) / self.nsample
-#                 reggroupinnerloss = reggroupinnerloss +  torch.sum(torch.abs(datatemp - fjj[pointindex, :, :])) / self.nsample
-#
-#
-#
-#             for pointindex, points in enumerate(fii1):
-#                 datatemp = torch.unsqueeze(points, 0)
-#                 inner_product = torch.mm(datatemp, fjj[pointindex, :, :].t())
-#                 norms1 = torch.norm(datatemp, dim=1)
-#                 norms2 = torch.norm(fjj[pointindex, :, :], dim=1)
-#                 similar_matrix = inner_product / torch.mm(norms1.view(-1, 1), norms2.view(1, -1))
-#                 similar_matrix[similar_matrix > 1] = 1.0
-#                 crossgroupinnerloss = crossgroupinnerloss + torch.sum(torch.pow((1 - similar_matrix), 2)) / self.nsample
-#                 reggroupinnerloss = reggroupinnerloss + torch.sum(torch.abs(datatemp - fjj1[pointindex, :, :])) / self.nsample
-#
-#
-#             crossgroupinnerloss = crossgroupinnerloss / self.downsample
-#             reggroupinnerloss = reggroupinnerloss / self.downsample
-#
-#         crossgroupinnerloss = crossgroupinnerloss / self.b
-#         reggroupinnerloss = reggroupinnerloss / self.b
-#
-#         ##################grouploss####################
-#
-#
-#
-#         return globalloss, globalpointloss, crossgroupinnerloss, reggroupinnerloss * 0.1
