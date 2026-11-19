@@ -24,6 +24,7 @@ import math
 from collections import defaultdict, Counter
 
 
+
 torch.backends.cudnn.benchmark = False
 warnings.simplefilter(action='ignore', category=FutureWarning)
 sys.path.insert(0, os.path.abspath(
@@ -312,6 +313,29 @@ def get_ins_mious(pred, target, cls, cls2parts, multihead=False,):
 
     return ins_mious
 
+def farthest_point_sample(x, num_samples):
+    """
+    Farthest Point Sampling (FPS) implementation for 2D point clouds.
+    :param x: Input tensor of shape (B, N, D) where B is the batch size,
+              N is the number of points, and D is the number of dimensions.
+    :param num_samples: Number of points to sample.
+    :return: Indices of the sampled points.
+    """
+    B, N, D = x.shape
+    centroids = torch.zeros(B, num_samples, dtype=torch.long).to(x.device)
+    distance = torch.ones(B, N).to(x.device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(x.device)
+    batch_indices = torch.arange(B, dtype=torch.long).to(x.device)
+
+    for i in range(num_samples):
+        centroids[:, i] = farthest
+        centroid = x[batch_indices, farthest, :].view(B, 1, D)
+        dist = torch.sum((x - centroid) ** 2, -1)
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        farthest = torch.max(distance, -1)[1]
+
+    return centroids
 
 def main(gpu, cfg):
     if cfg.distributed:
@@ -357,7 +381,7 @@ def main(gpu, cfg):
 
     #model = build_model_from_cfg(cfg.model).cuda()
     device = torch.device('cuda:0')
-    model = pointMLP(2,4096).to(device)  #partnums, points
+    model = pointMLP(2, 4096).to(device)  #partnums, points
     model.apply(weight_init)
 
     model_size = cal_model_parm_nums(model)
@@ -429,7 +453,19 @@ def main(gpu, cfg):
     criterion = build_criterion_from_cfg(cfg.criterion_args).cuda()
     segcriterion = SegmentLoss().cuda()
     # ===> start training
-    best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+    
+    # best_ins_miou, cls_miou_when_best, cls_mious_when_best = 0., 0., []
+    best_ins_miou, cls_miou_when_best, cls_mious_when_best = float('-inf'), 0., []
+    best_epoch = None
+
+    # Early Stopping 参数
+    early_stop_min_epoch = 100
+    early_stop_patience = 10
+    early_stop_min_delta = 0.0
+
+    early_stop_counter = 0
+    early_stop_reference = float('-inf')
+    early_stop_enabled = False
 
     for epoch in range(cfg.start_epoch, cfg.epochs + 1):
         if cfg.distributed:
@@ -459,6 +495,22 @@ def main(gpu, cfg):
                         f'Find a better ckpt @E{epoch}, val_ins_miou {best_ins_miou:.2f} val_cls_miou {cls_miou_when_best:.2f}, '
                         f'\ncls_mious: {cls_mious_when_best}')
 
+        # 达到最小训练轮数后，开始监控 Early Stopping
+        if epoch % cfg.val_freq == 0 and epoch >= early_stop_min_epoch:
+            val_score = float(val_ins_miou.item())
+            if not early_stop_enabled:
+                early_stop_enabled = True
+                early_stop_reference = val_score
+                early_stop_counter = 0
+                logging.info(f"Early Stopping monitoring starts at epoch {epoch}.")
+            elif val_score > early_stop_reference + early_stop_min_delta:
+                early_stop_reference = val_score
+                early_stop_counter = 0
+            else:
+                early_stop_counter += 1
+            logging.info(
+                f"Early Stopping: {early_stop_counter}/{early_stop_patience} validation checks without improvement.")
+        
         lr = optimizer.param_groups[0]['lr']
         if writer is not None:
             writer.add_scalar('val_ins_miou', val_ins_miou, epoch)
@@ -479,7 +531,7 @@ def main(gpu, cfg):
         # 保存为Excel文件
         model_name = cfg.cfg_basename.split('_')[0]
         # save_path = 'log/pictures/' + model_name  # 指定
-        save_path = r"log/pictures/pointmlp/rice_pointmlp_super_80/"
+        save_path = r"log/pictures/pointmlp/rice_all/"
         if not os.path.exists(save_path):  # 如果文件夹不存在，则创建它
             os.makedirs(save_path)
         df = pd.DataFrame(record_all)
@@ -498,9 +550,14 @@ def main(gpu, cfg):
         save_path_4 = save_path + '/' + 'record_epoch.xlsx'  # 指定文件夹路径
         df3.to_excel(save_path_4, index=False)
 
-    # if writer is not None:
-    #     Wandb.add_file(os.path.join(cfg.ckpt_dir, f'{cfg.run_name}_ckpt_best.pth'))
-    # Wandb.add_file(os.path.join(cfg.ckpt_dir, f'{cfg.logname}_ckpt_latest.pth'))
+        # Early Stopping：决定是否提前结束训练
+        if early_stop_enabled and early_stop_counter >= early_stop_patience:
+            logging.info(
+                f"Early Stopping triggered at epoch {epoch}; "
+                f"best epoch: {best_epoch}, "
+                f"best val instance mIoU: {best_ins_miou:.4f}.")
+            break
+
     with np.printoptions(precision=2, suppress=True):
         logging.info(f'Best Epoch {best_epoch},'
                      f'Instance mIoU {best_ins_miou:.2f}, '
@@ -508,7 +565,7 @@ def main(gpu, cfg):
                      f'\n Class mIoUs {cls_mious_when_best}')
 
     if cfg.get('num_votes', 0) > 0:
-        # pretrained_path = r"/data/home/whs/Pointnext/examples/shapenetpart/log/shapenetpart/pointmlp_wheat_90/checkpoint/ckpt_best.pth"
+        # pretrained_path = r"/data/home/whs/Pointnext/examples/shapenetpart/log/shapenetpart/pointmlp/wheat_pointmlp_unsuper_100/checkpoint/ckpt_best.pth"
         # load_checkpoint(model, pretrained_path)
         load_checkpoint(model, pretrained_path=os.path.join(cfg.ckpt_dir, 'ckpt_best.pth'))
         print(load_checkpoint)
@@ -517,7 +574,8 @@ def main(gpu, cfg):
 
         test_ins_miou, test_cls_miou, test_part_iou, test_part_acc, test_part_pre, test_part_recall, test_cls_mious  = testmetric(model, test_loader, cfg, num_votes=cfg.get('num_votes', 0), data_transform=voting_transform)
         with np.printoptions(precision=2, suppress=True):
-            logging.info(f'---Voting---\nBest Epoch {best_epoch},'
+            logging.info(
+                f'---Voting---\nBest Epoch {best_epoch},'
                          f''f'Voting Instance mIoU {test_ins_miou:.2f}, '
                          f''f'Voting Class mIoU {test_cls_miou:.2f}, '
                          # f''f'Voting Class Part_IoU {test_part_iou:.2f}, '
@@ -554,13 +612,13 @@ def main(gpu, cfg):
     # save_path_4 = save_path + '/' + 'record_epoch.xlsx'  # 指定文件夹路径
     # df3.to_excel(save_path_4, index=False)
 
-    # 绘制loss的折线图并保存到指定文件夹
+    # #绘制loss的折线图并保存到指定文件夹
     fig, ax = plt.subplots()
     ax.plot(record_iter_val['loss'], label='iter_loss_val')
     ax.plot(record_iter_train['loss'], label='iter_loss_train')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Loss')
-    # 设置x轴和y轴范围及刻度
+    # #设置x轴和y轴范围及刻度
     plt.xlim(0, epoch + 1)
     plt.xticks(np.arange(0, epoch + 1, 3))
     max_y1 = math.ceil(max(record_iter_train['loss']))
@@ -572,15 +630,15 @@ def main(gpu, cfg):
         plt.yticks(np.arange(0, max_y1, max_y1 / 10))
     ax.legend()
     fig.savefig(os.path.join(save_path, 'Iter_Loss.png'))
-    # plt.show()
+    # #plt.show()
 
-    # 绘制loss的折线图并保存到指定文件夹
+    # #绘制loss的折线图并保存到指定文件夹
     fig, ax = plt.subplots()
     ax.plot(record_epoch['train'], label='Train Loss')
     ax.plot(record_epoch['val'], label='Val Loss')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Loss')
-    # 设置x轴和y轴范围及刻度
+    # #设置x轴和y轴范围及刻度
     plt.xlim(0, epoch + 1)
     plt.xticks(np.arange(0, epoch + 1, 3))
     max_y1 = math.ceil(max(record_epoch['val']))
@@ -972,7 +1030,7 @@ def testmetric(model, val_loader, cfg, num_votes=0, data_transform=None):
         bsize, _, _ = seg_points.shape
         leafarr = []
         disarr = []
-        predictedpath = "/data/home/whs/Pointnext/examples/shapenetpart/log/visual/pointmlp/rice_pointmlp_super_80/"  # 保存可视化预测结果的txt的路径
+        predictedpath = "/data/home/whs/Pointnext/examples/shapenetpart/log/visual/pointmlp/rice_all/"  # 保存可视化预测结果的txt的路径
         if not os.path.exists(predictedpath):
             os.makedirs(predictedpath)
 
